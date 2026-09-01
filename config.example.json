@@ -25,10 +25,9 @@
   "search_limit": 50,
   "query_delay_ms": 120,
 
-  "max_candidates_per_run": 40,
+  "max_candidates_per_run": 300,
   "max_jobs_per_batch": 10,
-  "max_batches_per_run": 4,
-  "max_run_seconds": 600,
+  "max_run_seconds": 3000,
   "max_prompt_chars": 180000,
   "max_job_description_chars": 9000,
   "max_notifications_per_run": 8,

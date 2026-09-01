@@ -21,12 +21,17 @@ flowchart TD
     NORM --> UPSERT[(SQLite: jobs)]
     UPSERT --> SELECT[Select pending candidates]
     SELECT --> DEDUPE[Suppress reposts]
-    DEDUPE --> BATCH[Bounded batching]
-    BATCH --> EVAL[Semantic evaluation]
+    DEDUPE --> FREEZE[Freeze snapshot]
+    FREEZE --> BATCH[Split into batches of 10]
+    BATCH --> EVAL[Evaluate every batch in order]
     EVAL --> VALIDATE[Schema + completeness validation]
     VALIDATE --> POLICY[Deterministic policy layer]
     POLICY --> STORE[(SQLite: evaluations)]
-    STORE --> NOTIFY[Rank, dedupe, emit cards]
+    STORE --> CLEAN{Any IDs omitted?}
+    CLEAN -- yes, provider healthy --> RETRY[One bounded cleanup pass]
+    RETRY --> RANK
+    CLEAN -- no --> RANK[Rank globally across the whole snapshot]
+    RANK --> NOTIFY[Dedupe, emit cards]
     NOTIFY --> SUMMARY[One compact summary line]
 ```
 
@@ -179,20 +184,54 @@ suppression existed still cannot produce two cards.
 
 ## Semantic evaluation
 
+### The frozen snapshot
+
+A run takes its candidate set **once**:
+
+```python
+candidates = db.pending_jobs(version, ceiling)     # taken once, never re-queried
+```
+
+Nothing re-reads the queue mid-run. A vacancy discovered while the run is
+working belongs to the next run. This is what makes a run auditable: the set it
+was asked to evaluate is fixed before the first model call.
+
+The invariant is **evaluate the complete frozen snapshot before reporting**, not
+*process up to N jobs*. `max_batches_per_run` does not exist.
+
 ### Batching
 
 `iter_batches` fills a batch until either `max_jobs_per_batch` (10) or
 `max_prompt_chars` (180 000) is reached, estimating each job's serialized size.
-Batches are then capped at `max_batches_per_run` (4). The candidate profile and
-rules are sent once per batch, not once per job — that is where most of the
-token saving comes from.
+Batch size stays at 10 because that is where provider completeness was
+validated; the number of batches is whatever the snapshot requires. The
+candidate profile and rules are sent once per batch, not once per job — that is
+where most of the token saving comes from.
 
-A wall-clock budget (`max_run_seconds`, default 600) is checked before each
-batch, and a batch only starts if its *worst case* still fits:
+`run_batch_pass` walks the batches in order and is used twice: once for the main
+pass, once for the cleanup pass.
+
+### Two emergency valves
+
+Neither is a throughput cap, and a normal run reaches neither.
+
+`max_candidates_per_run` (default 300, cap 500) bounds how much of the pending
+queue one run holds in memory. If it truncates the snapshot, the run says so
+explicitly in its summary — a partial view of the market must never be reported
+as a complete one:
 
 ```python
-if index and time.monotonic() + settings.gateway_timeout_seconds > run_deadline:
-    break   # remaining jobs stay pending, run reports partial
+ceiling_reached = len(candidates) >= ceiling and eligible_total > ceiling
+```
+
+`max_run_seconds` (default 3000) bounds wall clock. A batch only starts if its
+*worst case* still fits, and whatever was never attempted comes back to the
+caller as deferred rather than lost:
+
+```python
+if index and time.monotonic() + reserve_seconds > deadline:
+    outcome.deferred.extend(remaining)
+    return outcome
 ```
 
 ### Provider routing
@@ -231,15 +270,41 @@ independently verifies completeness against the requested ID set:
 
 | Condition | Handling |
 |---|---|
-| Duplicate `source_job_id` | Every copy is discarded; the ID stays pending. |
+| Duplicate `source_job_id` | Every copy is discarded; the ID stays unresolved. |
 | Unknown `source_job_id` | Discarded and recorded as an error. |
-| Missing `source_job_id` | Left pending for the next run. |
+| Missing `source_job_id` | Collected as unresolved; later batches still run. |
 | Individually invalid row | Discarded; the rest of the batch is kept. |
-| Invalid JSON envelope | Whole batch left pending; no retry. |
+| Invalid JSON envelope | Whole batch preserved, and the pass stops. |
 
-Any error stops the run after the current batch, so a misbehaving provider
-cannot burn the remaining budget. Untouched jobs remain pending. The raw content
-is archived to `data/last_<provider>_response.txt`, or to
+### Three outcomes, not one
+
+Conflating "the model omitted two IDs" with "the provider is broken" is what
+used to abort a run early. `ProviderBatchResult.error_kind` separates them:
+
+| `error_kind` | Meaning | Effect on the pass |
+|---|---|---|
+| `completeness` | The envelope parsed. Some requested IDs came back missing or individually invalid. | **Continue.** Valid rows are saved, missing IDs are collected for cleanup. |
+| `output` | The envelope could not be parsed at all. | Stop. This batch and all later batches are preserved. |
+| `transport` | Both providers failed to answer. | Stop. Same preservation. |
+
+A completeness gap is a normal quirk of schema-constrained generation, not a
+failure, and treating it as one silently delayed good roles.
+
+### The cleanup pass
+
+After the main pass, IDs that were never resolved get **exactly one** more
+attempt, re-split into fresh batches:
+
+```python
+if outcome.unresolved and outcome.provider_error is None:
+    cleanup = run_batch_pass(..., cleanup=True)
+```
+
+Never recursive, and skipped entirely when the provider already failed this run
+— there is no point re-asking something that is broken. Anything still
+unresolved afterwards stays pending for the next scheduled run.
+
+The raw content is archived to `data/last_<provider>_response.txt`, or to
 `data/model_failures/` when the batch failed.
 
 ---
@@ -304,10 +369,15 @@ response.
 
 ## Notification
 
-Evaluations with a notify decision and no `notifications` row are selected,
-ranked by decision and `opportunity_score`, capped at
-`max_notifications_per_run`, and passed through fingerprint deduplication a
-second time. Each card carries the decision icon, both scores, location, what
+Delivery happens **only after every batch, including the cleanup pass, has
+completed.** Evaluations with a notify decision and no `notifications` row are
+then selected and ranked **globally across the whole snapshot** by decision and
+`opportunity_score`, capped at `max_notifications_per_run`, and passed through
+fingerprint deduplication a second time.
+
+Ranking after the fact rather than per batch is the point: the strongest
+opportunity in the snapshot is reported first regardless of which batch produced
+it, and can no longer be buried simply because it appeared late in the queue. Each card carries the decision icon, both scores, location, what
 the role *actually is*, up to three fit reasons, up to two gaps, up to two
 blockers, the deadline and the URL.
 
@@ -338,19 +408,25 @@ rather than stored. Everything degrades into "still pending":
 |---|---|---|
 | Some discovery queries fail | Continue with what succeeded | 0 |
 | All discovery queries fail | Nothing to persist | non-zero |
-| Provider transport/timeout/429/5xx | One fallback call, then leave pending | 0, partial |
-| Both providers temporarily unavailable | Whole batch pending | 0, partial |
-| HTTP 200 with malformed content | Keep valid rows, leave the rest pending, stop after this batch | 0, partial |
-| Runtime budget exhausted | Remaining batches never start | 0, partial |
+| Provider transport/timeout/429/5xx | One fallback call | 0 |
+| Both providers temporarily unavailable | `transport`: this batch and all later ones preserved | 0, partial |
+| HTTP 200, envelope fine, IDs missing | `completeness`: save valid rows, **keep going**, cleanup pass at the end | 0 |
+| HTTP 200 with an unparseable envelope | `output`: this batch and all later ones preserved | 0, partial |
+| Emergency runtime budget exhausted | Remaining batches never start, come back as deferred | 0 |
+| Candidate ceiling truncates the snapshot | Run reports itself explicitly incomplete | 0 |
 | Permanent provider or config error | Fail loudly | non-zero |
 | Second concurrent run | `fcntl` lock not acquired, exit quietly | 0 |
 
 Bounded HTTP retry with `Retry-After` support and jittered backoff sits under
 all of this, for 408, 409, 425, 429, 500, 502, 503 and 504.
 
-A partial run is recorded in `runs` with `status='partial'` and its reasons, and
-the summary line says `⚠️ … N pending retry`, so degradation is visible without
-being alarming.
+Note what is *not* a partial run any more. Work that is simply queued for next
+time — omitted IDs the cleanup pass could not recover, batches the runtime valve
+never started — is healthy, and the summary reports it as
+`N queued for next run`. Only a genuine provider failure produces
+`⚠️ … N pending after provider error` and `status='partial'` in `runs`.
+Distinguishing the two is what keeps a scheduled alert meaningful: a warning
+that fires on normal operation is a warning nobody reads.
 
 ---
 
@@ -364,10 +440,29 @@ Plain cron, delivering to wherever you want the alert to land:
 30 8 * * *  /usr/bin/python3 $HOME/.local/scripts/rolelens.py run 2>>$HOME/rolelens.log
 ```
 
+Or a systemd timer, if you would rather journald kept the operational log:
+
+```ini
+# rolelens.service
+[Service]
+Type=oneshot
+TimeoutStartSec=3600
+ExecStart=/usr/bin/python3 %h/.local/scripts/rolelens.py run
+
+# rolelens.timer
+[Timer]
+OnCalendar=*-*-* 08:30:00
+Persistent=true
+```
+
 Two operational requirements:
 
-1. **Timeout headroom.** Discovery makes many small queries and a model batch can
-   be slow. A 120-second default is not enough; allow around 300 seconds.
+1. **Timeout headroom.** A run evaluates its whole snapshot, so the scheduler's
+   per-task timeout must be **strictly greater than `max_run_seconds` plus one
+   `gateway_timeout_seconds` of reserve** — at least 3600 seconds with the
+   defaults. RoleLens bounds its own runtime; the scheduler only has to let it
+   finish. A run killed externally never emits its summary or marks its
+   notifications, so the work is simply repeated on the next tick.
 2. **Timezone.** Confirm the server's local time before choosing the hour.
 
 Any scheduler works — cron, systemd timers, a CI schedule — as long as it can run

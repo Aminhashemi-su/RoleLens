@@ -65,23 +65,28 @@ blocks you — and that is information a single blended number destroys.
    and upserted into SQLite under a `UNIQUE(source, source_job_id)` key. A
    SHA-256 content hash of the meaningful fields decides whether an advertisement
    has genuinely changed.
-3. **Candidate selection.** Jobs with no evaluation for the current content hash
-   *and* the current profile version are pending. They are ordered by a cheap
-   deterministic discovery score, and reposts of an already-evaluated vacancy are
-   suppressed before they can cost a model call.
-4. **Semantic evaluation.** Pending jobs are sent to the model in bounded
-   batches, with a JSON-schema-constrained output contract. The candidate profile
-   is sent once per batch, not once per job.
+3. **Snapshot selection.** Jobs with no evaluation for the current content hash
+   *and* the current profile version are pending. The run takes them **once**, as
+   a frozen snapshot that is never re-queried, so a vacancy discovered mid-run
+   belongs to the next run and this run stays auditable. Reposts of an
+   already-evaluated vacancy are suppressed before they can cost a model call.
+4. **Semantic evaluation.** The whole snapshot is evaluated, in sequential
+   batches of at most 10, with a JSON-schema-constrained output contract. The
+   candidate profile is sent once per batch, not once per job. There is no
+   per-run job cap: batch size is bounded, throughput is not.
 5. **Validation.** Every requested `source_job_id` must come back exactly once.
-   Duplicate, unknown and missing IDs are recorded. Independently valid rows are
-   kept; unresolved IDs stay pending for the next run.
+   A batch that comes back short is a *completeness gap*, not a failure — its
+   valid rows are saved and later batches continue. Omitted IDs get exactly one
+   bounded cleanup pass at the end of the run.
 6. **Deterministic policy layer.** The model's own `decision` field is never
    trusted. RoleLens applies narrow, auditable rules to the model output and
    then derives the decision itself from validated scores and blockers.
-7. **Notification.** Only new decisions above the threshold are printed to
-   stdout, ranked, deduplicated, and followed by exactly one compact run-summary
-   line. Operational logs go to stderr, so stdout can be delivered verbatim to a
-   chat channel by any scheduler.
+7. **Notification.** Only after every batch has completed are matches ranked
+   **globally** and printed to stdout, deduplicated, followed by exactly one
+   compact run-summary line. Ranking after the fact is what stops the strongest
+   opportunity being buried because it happened to appear late in the queue.
+   Operational logs go to stderr, so stdout can be delivered verbatim to a chat
+   channel by any scheduler.
 
 There is no auto-apply. RoleLens tells you what to look at; you decide what to
 do about it.
@@ -182,18 +187,36 @@ unexpected failure, `130` interrupted.
 | `search_terms`, `location_terms` | Cross-producted into the discovery queries. |
 | `include_unlocated_searches` | Also run each term without a location. |
 | `search_limit` | Hits per query, capped at 100. |
-| `max_candidates_per_run` | Jobs selected for evaluation per run (default 40, cap 200). |
+| `max_candidates_per_run` | **Emergency ceiling** on snapshot size (default 300, cap 500). Not a throughput cap — see below. |
 | `max_jobs_per_batch` | Jobs per model call (default and cap 10). |
-| `max_batches_per_run` | Sequential model calls per run (default 4, cap 10). |
-| `max_run_seconds` | Wall-clock budget; a batch only starts if its worst case fits. |
+| `max_run_seconds` | **Emergency** wall-clock budget (default 3000). A batch only starts if its worst case fits. |
 | `max_prompt_chars`, `max_job_description_chars` | Prompt size guardrails. |
 | `max_notifications_per_run` | Cards emitted per run. |
 | `preferred_locations`, `high_signal_title_terms` | Inputs to the cheap discovery score. |
 | `northern_exclusions` | Locations pre-filtered out unless the role is fully remote. |
 | `jobsearch_timeout_seconds`, `gateway_timeout_seconds`, `http_retries` | Transport limits. |
 
-These are cost guardrails, not semantic rejection rules. Anything not evaluated
-in a run stays pending for the next one.
+Most of these are cost guardrails, not semantic rejection rules. Anything not
+evaluated in a run stays pending for the next one.
+
+`max_candidates_per_run` and `max_run_seconds` are different: they are
+**emergency valves, not throughput caps**. One bounds how much of the pending
+queue a single run will hold in memory, the other bounds wall clock. A normal
+run never reaches either. When the candidate ceiling *is* reached the run says
+so explicitly in its summary, because a truncated snapshot is not a complete
+picture of the market and must not be reported as one.
+
+### Scheduler timeout
+
+Whatever runs RoleLens on a schedule — cron, a systemd timer, a CI schedule, a
+task runner — its per-task timeout **must be greater than `max_run_seconds`
+plus one `gateway_timeout_seconds` of reserve**. With the defaults that is
+3000 + 150, so allow at least 3600 seconds.
+
+A run killed externally before its internal budget expires never gets to emit
+its summary or mark its notifications, so the work is simply repeated on the
+next tick. RoleLens bounds its own runtime; the scheduler only needs to let it
+finish.
 
 ### Environment variables
 
@@ -230,7 +253,11 @@ The short version:
 - **Structured output** — a JSON schema is enforced natively by both providers,
   and completeness is verified afterwards regardless.
 - **Deterministic policy layer** — the part that decides. See below.
-- **Recovery** — durable pending queue, bounded batching, no semantic retries.
+- **Completeness** — a run evaluates its whole frozen snapshot in sequential
+  batches of at most 10, then ranks globally and delivers once. A short batch is
+  a completeness gap, not a failure, and gets one bounded cleanup pass.
+- **Recovery** — durable pending queue; pending-ness is derived from state, so
+  an interrupted run leaves the queue correct.
 
 ### Why the model does not get the last word
 
@@ -266,11 +293,12 @@ Only then is the decision computed, from validated numbers:
 python3 -m unittest discover -s tests -v
 ```
 
-53 tests. No network, no API key, no cost. They cover the decision classifier,
+73 tests. No network, no API key, no cost. They cover the decision classifier,
 the Swedish-language policy rules, provider routing and fallback semantics,
-database idempotency and re-queueing on content change, multi-batch throughput
-and the runtime budget, repost suppression, and the run-summary wording in every
-state.
+database idempotency and re-queueing on content change, snapshot completeness,
+completeness gaps versus transport failures, the bounded cleanup pass, global
+ranking and delivery ordering, the emergency runtime budget and candidate
+ceiling, repost suppression, and the run-summary wording in every state.
 
 ---
 
@@ -326,7 +354,7 @@ Methodology and results are in
 
 ## Project status
 
-Version **1.5.1**. Running daily in production for a single user, against the
+Version **1.5.2**. Running daily in production for a single user, against the
 Swedish market, since 2026. It is a personal tool published because the design
 is more broadly interesting, not a product.
 

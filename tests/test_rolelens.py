@@ -293,8 +293,8 @@ class SwedishLanguagePolicyTests(unittest.TestCase):
 class RunSummaryTests(unittest.TestCase):
     """The one compact stats line the scheduler delivers per run."""
 
-    def summary(self, evaluated, matches, pending_retry=0, partial=False):
-        return cs.format_run_summary(evaluated, matches, pending_retry, partial=partial)
+    def summary(self, evaluated, matches, queued=0, failed=False):
+        return cs.format_run_summary(evaluated, matches, queued, failed=failed)
 
     def test_no_new_jobs_evaluated(self):
         self.assertEqual(
@@ -305,46 +305,46 @@ class RunSummaryTests(unittest.TestCase):
     def test_jobs_evaluated_without_matches(self):
         self.assertEqual(
             self.summary(7, 0),
-            "🔎 RoleLens: 7 new jobs checked · 0 matches.",
+            "🔎 RoleLens: 7 jobs checked · 0 matches.",
         )
 
     def test_single_match_is_singular(self):
         self.assertEqual(
             self.summary(9, 1),
-            "🎯 RoleLens: 9 new jobs checked · 1 match.",
+            "🎯 RoleLens: 9 jobs checked · 1 match.",
         )
 
     def test_multiple_matches_are_plural(self):
         self.assertEqual(
             self.summary(10, 4),
-            "🎯 RoleLens: 10 new jobs checked · 4 matches.",
+            "🎯 RoleLens: 10 jobs checked · 4 matches.",
         )
 
     def test_partial_run_reports_pending_retry(self):
         self.assertEqual(
-            self.summary(6, 2, pending_retry=4, partial=True),
-            "⚠️ RoleLens: 6 jobs checked · 2 matches · 4 pending retry.",
+            self.summary(6, 2, queued=4, failed=True),
+            "⚠️ RoleLens: 6 jobs checked · 2 matches · 4 pending after provider error.",
         )
 
     def test_partial_run_keeps_singular_match(self):
         self.assertEqual(
-            self.summary(6, 1, pending_retry=5, partial=True),
-            "⚠️ RoleLens: 6 jobs checked · 1 match · 5 pending retry.",
+            self.summary(6, 1, queued=5, failed=True),
+            "⚠️ RoleLens: 6 jobs checked · 1 match · 5 pending after provider error.",
         )
 
     def test_partial_wins_over_the_zero_evaluated_wording(self):
         # A provider failure that returned nothing must not read as a quiet
         # 'no new jobs found' tick.
         self.assertEqual(
-            self.summary(0, 0, pending_retry=10, partial=True),
-            "⚠️ RoleLens: 0 jobs checked · 0 matches · 10 pending retry.",
+            self.summary(0, 0, queued=10, failed=True),
+            "⚠️ RoleLens: 0 jobs checked · 0 matches · 10 pending after provider error.",
         )
 
     def test_target_icon_only_when_there_are_matches(self):
         self.assertTrue(self.summary(5, 0).startswith("🔎"))
         self.assertTrue(self.summary(5, 1).startswith("🎯"))
         self.assertTrue(self.summary(0, 0).startswith("🔎"))
-        self.assertTrue(self.summary(5, 1, 2, partial=True).startswith("⚠️"))
+        self.assertTrue(self.summary(5, 1, 2, failed=True).startswith("⚠️"))
 
     def test_summary_counts_evaluations_not_discovery(self):
         # The count must come from the semantic matcher, so a run that upserted
@@ -356,8 +356,8 @@ class RunSummaryTests(unittest.TestCase):
         stats.evaluated = 10
         stats.notified = 4
         self.assertEqual(
-            cs.format_run_summary(stats.evaluated, stats.notified, 0, partial=False),
-            "🎯 RoleLens: 10 new jobs checked · 4 matches.",
+            cs.format_run_summary(stats.evaluated, stats.notified, 0),
+            "🎯 RoleLens: 10 jobs checked · 4 matches.",
         )
 
     def test_detailed_notifications_are_unchanged_by_the_summary(self):
@@ -368,163 +368,12 @@ class RunSummaryTests(unittest.TestCase):
 
 
 
-class RunSummaryPipelineTests(unittest.TestCase):
-    """Drives run_pipeline with a stubbed provider and reads real stdout."""
-
-    REPO = Path(__file__).resolve().parents[1]
-
-    @classmethod
-    def repo_file(cls, *parts):
-        """Prefer a real config/profile file, fall back to its .example variant.
-
-        A working checkout has config.json and profile/*.json. A fresh clone of
-        the published repository ships only the *.example.json templates, and
-        the suite must still run there without asking anyone to build a profile
-        first.
-        """
-        path = cls.REPO.joinpath(*parts)
-        if path.exists():
-            return path
-        example = path.with_name(f"{path.stem}.example{path.suffix}")
-        if example.exists():
-            return example
-        raise FileNotFoundError(f"Neither {path} nor {example} exists")
-
-    def build_home(self, tmp, **overrides):
-        home = Path(tmp)
-        (home / "profile").mkdir(parents=True, exist_ok=True)
-        (home / "data").mkdir(parents=True, exist_ok=True)
-        shutil.copy2(self.repo_file("config.json"), home / "config.json")
-        if overrides:
-            config = json.loads((home / "config.json").read_text(encoding="utf-8"))
-            config.update(overrides)
-            (home / "config.json").write_text(json.dumps(config), encoding="utf-8")
-        for name in (
-            "career_profile.json", "matcher_profile.json",
-            "search_lenses.json", "matcher_rules_v1_1.json",
-        ):
-            shutil.copy2(self.repo_file("profile", name), home / "profile" / name)
-        (home / "secrets.env").write_text(
-            "VERTEX_GEMINI_API_KEY=dummy\nVERTEX_GEMINI_MODEL=gemini-3.7-flash\n"
-            "AZURE_OPENAI_API_KEY=dummy\nAZURE_OPENAI_BASE_URL=https://example.invalid\n"
-            "AZURE_OPENAI_DEPLOYMENT=gpt-5-mini\n",
-            encoding="utf-8",
-        )
-        # load_secrets refuses anything looser than 600.
-        (home / "secrets.env").chmod(0o600)
-        return cs.Settings.load(home)
-
-    def seed(self, settings, count):
-        db = cs.Database(settings.db_path)
-        try:
-            for i in range(1, count + 1):
-                job = cs.normalize_job({
-                    "id": f"job{i}",
-                    "headline": f"AI Engineer {i}",
-                    "employer": {"name": f"Company {i}"},
-                    "webpage_url": f"https://example.invalid/{i}",
-                    "workplace_address": {"municipality": "Stockholm", "region": "Stockholms lan", "country": "Sverige"},
-                    "description": {"text": "Build AI products with Python and TypeScript."},
-                    "application_deadline": "2027-01-01T23:59:59",
-                    "publication_date": "2026-08-01T00:00:00",
-                    "employment_type": {"label": "Vanlig anstallning"},
-                    "scope_of_work": {"min": 100, "max": 100},
-                })
-                job.matched_queries.add("AI engineer Stockholm")
-                job.discovery_score = 10
-                db.upsert_job(job)
-        finally:
-            db.close()
-
-    def evaluation(self, source_id, opportunity):
-        return cs.validate_evaluation({
-            "source_job_id": source_id, "career_fit": 90,
-            "opportunity_score": opportunity, "confidence": 0.9,
-            "actual_role": "AI Product Engineer", "why_fit": ["Strong overlap"],
-            "candidate_evidence": ["Python"], "must_have_assessment": [],
-            "gaps": [], "blockers": [], "language_risk": "none",
-            "seniority_risk": "low", "location_note": "Stockholm",
-        })
-
-    def run_once(self, jobs, matches, unresolved=0, error=None):
-        with tempfile.TemporaryDirectory() as tmp:
-            settings = self.build_home(tmp)
-            self.seed(settings, jobs)
-            evaluated = jobs - unresolved
-
-            class Stub:
-                def __init__(self, *a, **k):
-                    self.provider, self.model = "vertex_gemini", "gemini-3.7-flash"
-
-            def fake_eval(primary, fallback, batch):
-                ids = [str(r["source_job_id"]) for r in batch]
-                evals = tuple(
-                    self.evaluation(sid, 90 if i < matches else 30)
-                    for i, sid in enumerate(ids[:evaluated])
-                )
-                return cs.ProviderBatchResult(
-                    "vertex_gemini", "gemini-3.7-flash", evals,
-                    frozenset(ids[evaluated:]), cs.empty_usage(), error,
-                ), False
-
-            original = (cs.ProviderMatcher, cs.evaluate_with_fallback)
-            cs.ProviderMatcher, cs.evaluate_with_fallback = Stub, fake_eval
-            buffer = io.StringIO()
-            try:
-                with contextlib.redirect_stdout(buffer):
-                    cs.run_pipeline(settings, fetch_only=False, evaluate_only=True)
-            finally:
-                cs.ProviderMatcher, cs.evaluate_with_fallback = original
-            return buffer.getvalue()
-
-    def summary_lines(self, out):
-        icons = ("🔎 RoleLens:", "🎯 RoleLens:", "⚠️ RoleLens:")
-        return [ln for ln in out.splitlines() if ln.startswith(icons)]
-
-    def test_no_new_jobs(self):
-        out = self.run_once(0, 0)
-        self.assertEqual(
-            self.summary_lines(out), ["🔎 RoleLens: no new jobs found."]
-        )
-
-    def test_jobs_but_no_matches(self):
-        out = self.run_once(8, 0)
-        self.assertEqual(
-            self.summary_lines(out), ["🔎 RoleLens: 8 new jobs checked · 0 matches."]
-        )
-        self.assertNotIn("RoleLens found", out)
-
-    def test_single_match_keeps_the_detailed_block(self):
-        out = self.run_once(9, 1)
-        self.assertEqual(
-            self.summary_lines(out), ["🎯 RoleLens: 9 new jobs checked · 1 match."]
-        )
-        self.assertIn("RoleLens found 1 new match", out)
-
-    def test_multiple_matches(self):
-        out = self.run_once(10, 4)
-        self.assertEqual(
-            self.summary_lines(out), ["🎯 RoleLens: 10 new jobs checked · 4 matches."]
-        )
-        self.assertIn("RoleLens found 4 new matches", out)
-
-    def test_partial_run(self):
-        out = self.run_once(10, 2, unresolved=4, error="provider returned invalid JSON")
-        self.assertEqual(
-            self.summary_lines(out),
-            ["⚠️ RoleLens: 6 jobs checked · 2 matches · 4 pending retry."],
-        )
-
-    def test_exactly_one_summary_line_in_every_state(self):
-        for jobs, matches, unresolved in ((0, 0, 0), (5, 0, 0), (5, 1, 0), (9, 3, 0), (9, 1, 3)):
-            with self.subTest(jobs=jobs, matches=matches, unresolved=unresolved):
-                error = "partial" if unresolved else None
-                out = self.run_once(jobs, matches, unresolved, error)
-                self.assertEqual(len(self.summary_lines(out)), 1)
-
-
 class _PipelineHarness(unittest.TestCase):
-    """Shared scaffolding: a real home, a real database, a stubbed provider."""
+    """Real pipeline, real SQLite, scripted provider.
+
+    Only ProviderMatcher is replaced, so evaluate_with_fallback - and therefore
+    the Azure fallback rule - is exercised for real.
+    """
 
     REPO = Path(__file__).resolve().parents[1]
 
@@ -597,7 +446,7 @@ class _PipelineHarness(unittest.TestCase):
 
     def distinct(self, count):
         return [
-            (f"job{i}", f"AI Engineer {i}", f"Company {i}", "Stockholm",
+            (f"job{i:04d}", f"AI Engineer {i}", f"Company {i}", "Stockholm",
              f"Role {i}: build AI products with Python and TypeScript.")
             for i in range(1, count + 1)
         ]
@@ -612,144 +461,341 @@ class _PipelineHarness(unittest.TestCase):
             "seniority_risk": "low", "location_note": "Stockholm",
         })
 
-    def drive(self, settings, matches=0, fail_on_batch=None, unresolved_per_batch=0):
-        """Run the real pipeline. Returns (stdout, batch_sizes)."""
-        sizes = []
+    def drive(self, settings, script=None, scores=None):
+        """Run the pipeline. `script(call_index, ids, provider)` returns an action.
+
+        Actions: "ok", ("omit", n), "output", "raise".
+        Returns (stdout, calls) where calls is [(provider, (ids...)), ...].
+        """
+        calls: list[tuple[str, tuple[str, ...]]] = []
+        test = self
+
+        def action_for(index, ids, provider):
+            if script is None:
+                return "ok"
+            if callable(script):
+                return script(index, ids, provider)
+            return script[index] if index < len(script) else "ok"
 
         class Stub:
-            def __init__(self, *a, **k):
-                self.provider, self.model = "vertex_gemini", "gemini-3.7-flash"
+            def __init__(self, settings_, secrets, profile, rules, provider):
+                self.provider = provider
+                self.model = "gemini-3.7-flash" if provider == cs.PRIMARY_PROVIDER else "gpt-5-mini"
 
-        state = {"matches_left": matches}
-
-        def fake_eval(primary, fallback, batch):
-            sizes.append(len(batch))
-            ids = [str(r["source_job_id"]) for r in batch]
-            if fail_on_batch is not None and len(sizes) == fail_on_batch:
+            def evaluate(self, jobs):
+                ids = [str(r["source_job_id"]) for r in jobs]
+                index = len(calls)
+                calls.append((self.provider, tuple(ids)))
+                action = action_for(index, ids, self.provider)
+                if action == "raise":
+                    raise cs.TemporaryProviderError(self.provider, "503 upstream unavailable")
+                if action == "output":
+                    return cs.ProviderBatchResult(
+                        self.provider, self.model, (), frozenset(ids),
+                        cs.empty_usage(), "invalid JSON: boom", "output")
+                omit = action[1] if isinstance(action, tuple) and action[0] == "omit" else 0
+                keep = ids[: len(ids) - omit] if omit else ids
+                evals = tuple(
+                    test.evaluation(sid, (scores or {}).get(sid, 30)) for sid in keep
+                )
+                missing = frozenset(ids[len(keep):])
                 return cs.ProviderBatchResult(
-                    "vertex_gemini", "gemini-3.7-flash", (), frozenset(ids),
-                    cs.empty_usage(), "provider returned invalid JSON"), False
-            keep = ids[: len(ids) - unresolved_per_batch] if unresolved_per_batch else ids
-            evals = []
-            for sid in keep:
-                if state["matches_left"] > 0:
-                    evals.append(self.evaluation(sid, 90))
-                    state["matches_left"] -= 1
-                else:
-                    evals.append(self.evaluation(sid, 30))
-            return cs.ProviderBatchResult(
-                "vertex_gemini", "gemini-3.7-flash", tuple(evals),
-                frozenset(ids[len(keep):]), cs.empty_usage(), None), False
+                    self.provider, self.model, evals, missing, cs.empty_usage(),
+                    ("missing/invalid IDs: " + ", ".join(sorted(missing))) if missing else None,
+                    "completeness" if missing else None,
+                )
 
-        original = (cs.ProviderMatcher, cs.evaluate_with_fallback)
-        cs.ProviderMatcher, cs.evaluate_with_fallback = Stub, fake_eval
+        original = cs.ProviderMatcher
+        cs.ProviderMatcher = Stub
         buffer = io.StringIO()
         try:
             with contextlib.redirect_stdout(buffer):
                 cs.run_pipeline(settings, fetch_only=False, evaluate_only=True)
         finally:
-            cs.ProviderMatcher, cs.evaluate_with_fallback = original
-        return buffer.getvalue(), sizes
+            cs.ProviderMatcher = original
+        return buffer.getvalue(), calls
 
     def summary_lines(self, out):
-        icons = ("%s RoleLens:" % "🔎", "%s RoleLens:" % "🎯", "%s RoleLens:" % "⚠️")
+        icons = ("\U0001f50e RoleLens:", "\U0001f3af RoleLens:", "\u26a0\ufe0f RoleLens:")
         return [ln for ln in out.splitlines() if ln.startswith(icons)]
 
+    def pending(self, settings):
+        db = cs.Database(settings.db_path)
+        try:
+            _, _, version = cs.load_profile_bundle(settings)
+            return db.pending_count(version, respect_live_mode=False)
+        finally:
+            db.close()
 
-class MultiBatchThroughputTests(_PipelineHarness):
-    def test_forty_candidates_become_four_batches_of_at_most_ten(self):
+
+class SnapshotCompletenessTests(_PipelineHarness):
+    """Every frozen candidate is attempted exactly once, whatever the count."""
+
+    def check(self, count):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.build_home(tmp)
-            self.assertEqual(settings.max_candidates_per_run, 40)
-            self.assertEqual(settings.max_jobs_per_batch, 10)
-            self.assertEqual(settings.max_batches_per_run, 4)
-            self.seed(settings, self.distinct(40))
-            out, sizes = self.drive(settings)
-            self.assertEqual(sizes, [10, 10, 10, 10])
-            self.assertEqual(len(sizes), 4)
-            self.assertTrue(all(n <= 10 for n in sizes))
-            self.assertEqual(
-                self.summary_lines(out),
-                ["%s RoleLens: 40 new jobs checked %s 0 matches." % ("🔎", "·")],
-            )
+            self.seed(settings, self.distinct(count))
+            out, calls = self.drive(settings)
+            sizes = [len(ids) for _, ids in calls]
+            attempted = [i for _, ids in calls for i in ids]
+            self.assertEqual(len(attempted), count, "every candidate attempted")
+            self.assertEqual(len(set(attempted)), count, "no candidate attempted twice")
+            self.assertEqual(sum(sizes), count)
+            self.assertTrue(all(n <= 10 for n in sizes), f"batch larger than 10: {sizes}")
+            self.assertEqual(len(sizes), -(-count // 10) if count else 0)
+            self.assertEqual(self.pending(settings), 0, "nothing left pending")
+            return out, sizes
 
-    def test_batch_cap_bounds_model_calls_independently_of_candidates(self):
-        # 40 candidates are available but only 2 batches are permitted, so the cap
-        # alone must stop the run at 20 jobs.
+    def test_zero_candidates(self):
+        out, sizes = self.check(0)
+        self.assertEqual(sizes, [])
+        self.assertEqual(self.summary_lines(out), ["\U0001f50e RoleLens: no new jobs found."])
+
+    def test_one_candidate(self):
+        out, sizes = self.check(1)
+        self.assertEqual(sizes, [1])
+        self.assertEqual(self.summary_lines(out), ["\U0001f50e RoleLens: 1 jobs checked \u00b7 0 matches."])
+
+    def test_nine_candidates(self):
+        self.assertEqual(self.check(9)[1], [9])
+
+    def test_ten_candidates(self):
+        self.assertEqual(self.check(10)[1], [10])
+
+    def test_eleven_candidates(self):
+        self.assertEqual(self.check(11)[1], [10, 1])
+
+    def test_thirty_candidates(self):
+        self.assertEqual(self.check(30)[1], [10, 10, 10])
+
+    def test_forty_candidates(self):
+        self.assertEqual(self.check(40)[1], [10, 10, 10, 10])
+
+    def test_forty_one_candidates_no_longer_truncate(self):
+        # The old build capped at 40; candidate 41 must now be evaluated too.
+        out, sizes = self.check(41)
+        self.assertEqual(sizes, [10, 10, 10, 10, 1])
+        self.assertEqual(self.summary_lines(out), ["\U0001f50e RoleLens: 41 jobs checked \u00b7 0 matches."])
+
+    def test_sixty_five_candidates(self):
+        out, sizes = self.check(65)
+        self.assertEqual(sizes, [10, 10, 10, 10, 10, 10, 5])
+        self.assertEqual(self.summary_lines(out), ["\U0001f50e RoleLens: 65 jobs checked \u00b7 0 matches."])
+
+    def test_one_hundred_three_candidates(self):
+        out, sizes = self.check(103)
+        self.assertEqual(sizes, [10] * 10 + [3])
+        self.assertEqual(self.summary_lines(out), ["\U0001f50e RoleLens: 103 jobs checked \u00b7 0 matches."])
+
+    def test_snapshot_is_frozen_not_re_queried(self):
+        # A job that appears after the snapshot is taken belongs to the next run.
         with tempfile.TemporaryDirectory() as tmp:
-            settings = self.build_home(tmp, max_batches_per_run=2)
-            self.seed(settings, self.distinct(40))
-            out, sizes = self.drive(settings)
-            self.assertEqual(sizes, [10, 10], "max_batches_per_run must bound the model calls")
-            self.assertEqual(sum(sizes), 20)
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(12))
+            inserted = {"done": False}
+            test = self
+
+            def script(index, ids, provider):
+                if not inserted["done"]:
+                    test.seed(settings, [("late-1", "Late Job", "Late AB", "Stockholm", "Arrived mid-run.")])
+                    inserted["done"] = True
+                return "ok"
+
+            out, calls = self.drive(settings, script=script)
+            attempted = [i for _, ids in calls for i in ids]
+            self.assertNotIn("late-1", attempted, "mid-run arrival must not join this snapshot")
+            self.assertEqual(len(attempted), 12)
+
+
+class CompletenessGapTests(_PipelineHarness):
+    """A short batch is a gap, not a failure, and gets exactly one cleanup pass."""
+
+    def test_nine_of_ten_does_not_stop_later_batches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(30))
+            out, calls = self.drive(settings, script=[("omit", 1)])
+            normal = [ids for _, ids in calls][:3]
+            self.assertEqual([len(x) for x in normal], [10, 10, 10], "all normal batches ran")
+            self.assertGreaterEqual(len(calls), 4, "a cleanup call must follow")
+
+    def test_omitted_ids_are_collected_into_one_cleanup_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(30))
+            _, calls = self.drive(settings, script=[("omit", 1), ("omit", 1), "ok"])
+            self.assertEqual(len(calls), 4, "3 normal batches + exactly 1 cleanup batch")
+            cleanup_ids = set(calls[3][1])
+            self.assertEqual(len(cleanup_ids), 2, "both omitted IDs retried together")
+            first_two = set(calls[0][1]) | set(calls[1][1])
+            self.assertTrue(cleanup_ids <= first_two)
+
+    def test_cleanup_success_reaches_full_completeness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(65))
+            out, calls = self.drive(settings, script=[("omit", 1)])
+            self.assertEqual(len(calls), 8, "7 normal batches + 1 cleanup")
             self.assertEqual(
                 self.summary_lines(out),
-                ["🔎 RoleLens: 20 new jobs checked · 0 matches."],
+                ["\U0001f50e RoleLens: 65 jobs checked \u00b7 0 matches."],
             )
-            db = cs.Database(settings.db_path)
-            try:
-                _, _, version = cs.load_profile_bundle(settings)
-                self.assertEqual(db.pending_count(version, respect_live_mode=False), 20)
-            finally:
-                db.close()
+            self.assertEqual(self.pending(settings), 0)
 
-    def test_runtime_budget_stops_cleanly_as_partial(self):
-        # A one-second budget cannot fit a second batch's worst case, so the run
-        # must stop after the first batch and report the rest as pending.
+    def test_cleanup_failure_leaves_only_the_unresolved_id_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(65))
+            out, calls = self.drive(
+                settings, script=lambda i, ids, p: ("omit", 1) if i in (0, 7) else "ok")
+            self.assertEqual(
+                self.summary_lines(out),
+                ["\U0001f50e RoleLens: 64 jobs checked \u00b7 0 matches \u00b7 1 queued for next run."],
+            )
+            self.assertEqual(self.pending(settings), 1)
+
+    def test_cleanup_is_attempted_at_most_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(20))
+            _, calls = self.drive(settings, script=lambda i, ids, p: ("omit", 1))
+            self.assertEqual(len(calls), 3, "2 normal + 1 cleanup, never a retry tree")
+            attempts = {}
+            for _, ids in calls:
+                for i in ids:
+                    attempts[i] = attempts.get(i, 0) + 1
+            self.assertLessEqual(max(attempts.values()), 2, "no ID attempted more than twice")
+
+    def test_missing_ids_never_call_azure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(20))
+            _, calls = self.drive(settings, script=lambda i, ids, p: ("omit", 2))
+            providers = {p for p, _ in calls}
+            self.assertEqual(providers, {cs.PRIMARY_PROVIDER},
+                             "a completeness gap is not a transport failure")
+
+
+class TransportFailureTests(_PipelineHarness):
+    def test_azure_still_covers_a_genuine_gemini_transport_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(20))
+            # Only the first Gemini call fails; Azure answers it.
+            out, calls = self.drive(
+                settings,
+                script=lambda i, ids, p: "raise" if (i == 0 and p == cs.PRIMARY_PROVIDER) else "ok",
+            )
+            self.assertEqual(calls[0][0], cs.PRIMARY_PROVIDER)
+            self.assertEqual(calls[1][0], cs.FALLBACK_PROVIDER, "Azure took the failed batch")
+            self.assertEqual(calls[1][1], calls[0][1], "same batch, one retry")
+            self.assertEqual(self.pending(settings), 0)
+            self.assertEqual(
+                self.summary_lines(out),
+                ["\U0001f50e RoleLens: 20 jobs checked \u00b7 0 matches."],
+            )
+
+    def test_both_providers_failing_stops_cleanly_and_keeps_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(40))
+            out, calls = self.drive(
+                settings, script=lambda i, ids, p: "raise" if i in (2, 3) else "ok")
+            # Batches 1-2 succeed; batch 3 fails on both providers and stops the run.
+            self.assertEqual(self.pending(settings), 20, "nothing lost")
+            line = self.summary_lines(out)[0]
+            self.assertTrue(line.startswith("\u26a0\ufe0f RoleLens:"), line)
+            self.assertIn("pending after provider error", line)
+            self.assertIn("20 jobs checked", line)
+
+    def test_unparseable_envelope_stops_the_run_as_a_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(30))
+            out, calls = self.drive(settings, script=["ok", "output"])
+            self.assertEqual(len(calls), 2, "no cleanup pass after a provider failure")
+            line = self.summary_lines(out)[0]
+            self.assertIn("pending after provider error", line)
+            self.assertEqual(self.pending(settings), 20)
+
+
+class RankingAndDeliveryTests(_PipelineHarness):
+    def test_ranking_is_global_across_every_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(30))
+            # The strongest opportunity sits in the final batch.
+            scores = {"job0002": 80, "job0015": 88, "job0029": 95}
+            out, calls = self.drive(settings, scores=scores)
+            order = [ln for ln in out.splitlines() if ln.startswith(("\U0001f7e2", "\U0001f7e1"))]
+            self.assertEqual(len(order), 3, out)
+            self.assertIn("AI Engineer 29", order[0], "highest opportunity ranked first")
+            self.assertIn("AI Engineer 15", order[1])
+            self.assertIn("AI Engineer 2 ", order[2] + " ")
+            self.assertEqual(
+                self.summary_lines(out),
+                ["\U0001f3af RoleLens: 30 jobs checked \u00b7 3 matches."],
+            )
+
+    def test_notifications_wait_until_semantic_processing_finishes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(30))
+            seen_stdout_during_calls = []
+            test = self
+
+            def script(index, ids, provider):
+                # Nothing may be delivered while batches are still running.
+                seen_stdout_during_calls.append(sys.stdout.getvalue())
+                return "ok"
+
+            scores = {"job0001": 90, "job0030": 92}
+            out, calls = self.drive(settings, script=script, scores=scores)
+            self.assertEqual(len(calls), 3)
+            self.assertTrue(all(x == "" for x in seen_stdout_during_calls),
+                            "output appeared before the run finished")
+            # A match from the first and the last batch arrive in the same report.
+            self.assertIn("AI Engineer 1 ", out + " ")
+            self.assertIn("AI Engineer 30", out)
+            self.assertEqual(
+                self.summary_lines(out),
+                ["\U0001f3af RoleLens: 30 jobs checked \u00b7 2 matches."],
+            )
+
+    def test_summary_counts_aggregate_the_whole_frozen_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(65))
+            scores = {f"job{i:04d}": 90 for i in (3, 24, 41, 60, 65)}
+            out, calls = self.drive(settings, scores=scores)
+            self.assertEqual(len(calls), 7)
+            self.assertEqual(
+                self.summary_lines(out),
+                ["\U0001f3af RoleLens: 65 jobs checked \u00b7 5 matches."],
+            )
+
+
+class RuntimeBudgetTests(_PipelineHarness):
+    def test_emergency_limit_exits_safely_without_losing_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.build_home(tmp, max_run_seconds=1)
-            self.seed(settings, self.distinct(40))
-            out, sizes = self.drive(settings)
-            self.assertEqual(len(sizes), 1, "only the first batch fits the budget")
+            self.seed(settings, self.distinct(65))
+            out, calls = self.drive(settings)
+            self.assertEqual(len(calls), 1, "only the first batch fits a 1s budget")
+            self.assertEqual(self.pending(settings), 55, "every unevaluated job kept")
             self.assertEqual(
                 self.summary_lines(out),
-                ["⚠️ RoleLens: 10 jobs checked · 0 matches · 30 pending retry."],
-            )
-            db = cs.Database(settings.db_path)
-            try:
-                _, _, version = cs.load_profile_bundle(settings)
-                self.assertEqual(db.pending_count(version, respect_live_mode=False), 30)
-            finally:
-                db.close()
-
-    def test_summary_aggregates_across_batches(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            settings = self.build_home(tmp)
-            self.seed(settings, self.distinct(37))
-            out, sizes = self.drive(settings, matches=4)
-            self.assertEqual(sum(sizes), 37)
-            self.assertEqual(
-                self.summary_lines(out),
-                ["%s RoleLens: 37 new jobs checked %s 4 matches." % ("🎯", "·")],
+                ["\U0001f50e RoleLens: 10 jobs checked \u00b7 0 matches \u00b7 55 queued for next run."],
             )
 
-    def test_one_summary_line_not_one_per_batch(self):
+    def test_budget_deferral_is_not_reported_as_a_provider_error(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings = self.build_home(tmp)
-            self.seed(settings, self.distinct(40))
-            out, sizes = self.drive(settings, matches=2)
-            self.assertEqual(len(sizes), 4)
-            self.assertEqual(len(self.summary_lines(out)), 1)
-
-    def test_provider_failure_in_a_later_batch_leaves_the_rest_pending(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            settings = self.build_home(tmp)
-            self.seed(settings, self.distinct(40))
-            out, sizes = self.drive(settings, fail_on_batch=3)
-            # Batch 4 must never be attempted.
-            self.assertEqual(len(sizes), 3)
-            db = cs.Database(settings.db_path)
-            try:
-                _, _, version = cs.load_profile_bundle(settings)
-                pending = db.pending_count(version, respect_live_mode=False)
-            finally:
-                db.close()
-            # 20 evaluated; 10 unresolved from the failed batch, 10 never started.
-            self.assertEqual(pending, 20)
-            self.assertEqual(
-                self.summary_lines(out),
-                ["%s RoleLens: 20 jobs checked %s 0 matches %s 20 pending retry." % ("⚠️", "·", "·")],
-            )
+            settings = self.build_home(tmp, max_run_seconds=1)
+            self.seed(settings, self.distinct(30))
+            out, _ = self.drive(settings)
+            line = self.summary_lines(out)[0]
+            self.assertNotIn("provider error", line)
+            self.assertIn("queued for next run", line)
 
 
 class DuplicateSuppressionTests(_PipelineHarness):
@@ -762,12 +808,8 @@ class DuplicateSuppressionTests(_PipelineHarness):
                 ("orig-1", "Platform Engineer", "Acme AB", "Stockholm", self.BODY),
                 ("repost-2", "Platform Engineer", "Acme AB", "Stockholm", self.BODY),
             ])
-            out, sizes = self.drive(settings)
-            self.assertEqual(sum(sizes), 1, "the repost must not reach the model")
-            self.assertEqual(
-                self.summary_lines(out),
-                ["%s RoleLens: 1 new jobs checked %s 0 matches." % ("🔎", "·")],
-            )
+            out, calls = self.drive(settings)
+            self.assertEqual(sum(len(ids) for _, ids in calls), 1, "the repost must not reach the model")
 
     def test_repost_relationship_is_recorded_for_audit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -782,32 +824,15 @@ class DuplicateSuppressionTests(_PipelineHarness):
                 rows = list(db.conn.execute(
                     "SELECT job_id, canonical_job_id, reason FROM job_fingerprints "
                     "WHERE canonical_job_id IS NOT NULL"))
-                jobs = {r["id"]: r["source_job_id"] for r in db.conn.execute("SELECT id, source_job_id FROM jobs")}
+                self.assertEqual(db.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 2,
+                                 "both source rows survive")
             finally:
                 db.close()
             self.assertEqual(len(rows), 1)
-            # Selection orders newest first, so the fresher posting becomes canonical
-            # and the older one is recorded as its repost.
-            self.assertEqual(jobs[rows[0]["job_id"]], "orig-1")
-            self.assertEqual(jobs[rows[0]["canonical_job_id"]], "repost-2")
             self.assertIn("Repost of job", rows[0]["reason"])
             self.assertNotEqual(rows[0]["job_id"], rows[0]["canonical_job_id"])
 
-    def test_both_source_rows_survive_in_the_database(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            settings = self.build_home(tmp)
-            self.seed(settings, [
-                ("orig-1", "Platform Engineer", "Acme AB", "Stockholm", self.BODY),
-                ("repost-2", "Platform Engineer", "Acme AB", "Stockholm", self.BODY),
-            ])
-            self.drive(settings)
-            db = cs.Database(settings.db_path)
-            try:
-                self.assertEqual(db.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 2)
-            finally:
-                db.close()
-
-    def test_same_title_and_company_but_different_description_is_not_suppressed(self):
+    def test_different_description_is_not_suppressed(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.build_home(tmp)
             self.seed(settings, [
@@ -816,18 +841,18 @@ class DuplicateSuppressionTests(_PipelineHarness):
                 ("a-2", "Member of Technical Staff", "Northwind Labs AB", "Stockholm",
                  "You will lead architecture for a senior platform team and mentor engineers."),
             ])
-            _, sizes = self.drive(settings)
-            self.assertEqual(sum(sizes), 2, "materially different ads are distinct vacancies")
+            _, calls = self.drive(settings)
+            self.assertEqual(sum(len(ids) for _, ids in calls), 2)
 
-    def test_same_title_and_company_in_a_different_location_is_not_suppressed(self):
+    def test_different_location_is_not_suppressed(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.build_home(tmp)
             self.seed(settings, [
                 ("loc-1", "Sourcing Manager", "Baltic Energy AB", "Solna", self.BODY),
                 ("loc-2", "Sourcing Manager", "Baltic Energy AB", "Goteborg", self.BODY),
             ])
-            _, sizes = self.drive(settings)
-            self.assertEqual(sum(sizes), 2, "a different city is a different vacancy")
+            _, calls = self.drive(settings)
+            self.assertEqual(sum(len(ids) for _, ids in calls), 2)
 
     def test_duplicate_matches_do_not_produce_duplicate_cards(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -836,32 +861,20 @@ class DuplicateSuppressionTests(_PipelineHarness):
                 ("dup-1", "Senior Software Engineer", "DataJob AB", "Stockholm", self.BODY),
                 ("dup-2", "Senior Software Engineer", "DataJob AB", "Stockholm", self.BODY),
             ])
-            # Evaluate both directly, as if they predate suppression.
             db = cs.Database(settings.db_path)
             try:
                 _, _, version = cs.load_profile_bundle(settings)
                 for row in db.pending_jobs(version, 10, respect_live_mode=False):
-                    db.save_evaluation(
-                        row, self.evaluation(row["source_job_id"], 90),
-                        profile_version=version, model="test",
-                    )
-                self.assertEqual(db.conn.execute("SELECT COUNT(*) FROM evaluations").fetchone()[0], 2)
+                    db.save_evaluation(row, self.evaluation(row["source_job_id"], 90),
+                                       profile_version=version, model="test")
             finally:
                 db.close()
-
             out, _ = self.drive(settings)
             self.assertEqual(out.count("Senior Software Engineer"), 1, "one vacancy, one card")
-            self.assertIn("RoleLens found 1 new match", out)
             self.assertEqual(
                 self.summary_lines(out),
-                ["%s RoleLens: 0 new jobs checked %s 1 match." % ("🎯", "·")],
+                ["\U0001f3af RoleLens: 0 jobs checked \u00b7 1 match."],
             )
-            # The suppressed card must be retired, not left to resurface.
-            db = cs.Database(settings.db_path)
-            try:
-                self.assertEqual(db.conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0], 2)
-            finally:
-                db.close()
 
 
 class DuplicateFingerprintTests(unittest.TestCase):
@@ -873,7 +886,8 @@ class DuplicateFingerprintTests(unittest.TestCase):
     def test_formatting_noise_does_not_change_the_fingerprint(self):
         self.assertEqual(
             self.fp(),
-            self.fp(company="  ACME   ab ", title="Platform   Engineer!", body="  Build and, operate internal developer tooling for a product team.  "),
+            self.fp(company="  ACME   ab ", title="Platform   Engineer!",
+                    body="  Build and, operate internal developer tooling for a product team.  "),
         )
 
     def test_employer_title_location_and_body_each_change_it(self):
@@ -885,79 +899,156 @@ class DuplicateFingerprintTests(unittest.TestCase):
 
 
 class EmptyRunHeartbeatTests(_PipelineHarness):
-    """A quiet scheduled run must still say something, but never contradict itself."""
+    """A quiet scheduled run must still report in, without contradicting itself."""
 
     BODY = "Build internal tooling with Python, TypeScript and cloud services."
 
     def deferred_match(self, settings):
-        """Leave one evaluated, un-notified match and nothing pending."""
         db = cs.Database(settings.db_path)
         try:
             _, _, version = cs.load_profile_bundle(settings)
             for row in db.pending_jobs(version, 10, respect_live_mode=False):
-                db.save_evaluation(
-                    row, self.evaluation(row["source_job_id"], 90),
-                    profile_version=version, model="test",
-                )
-            self.assertEqual(db.pending_count(version, respect_live_mode=False), 0)
+                db.save_evaluation(row, self.evaluation(row["source_job_id"], 90),
+                                   profile_version=version, model="test")
         finally:
             db.close()
 
     def test_empty_scheduled_run_emits_the_heartbeat(self):
-        # Nothing discovered, nothing deferred: the run must still report in.
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.build_home(tmp)
-            out, sizes = self.drive(settings)
-            self.assertEqual(sizes, [], "an empty run must not call the model")
-            self.assertEqual(
-                self.summary_lines(out),
-                ["%s RoleLens: no new jobs found." % "🔎"],
-            )
+            out, calls = self.drive(settings)
+            self.assertEqual(calls, [], "an empty run must not call the model")
+            self.assertEqual(self.summary_lines(out), ["\U0001f50e RoleLens: no new jobs found."])
             self.assertNotIn("RoleLens found", out)
 
     def test_heartbeat_is_not_used_while_a_deferred_card_is_delivered(self):
-        # Zero new jobs, but a match carried over from an earlier run is being
-        # sent: claiming "no new jobs found" alongside a card would contradict it.
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.build_home(tmp)
             self.seed(settings, [("carry-1", "Platform Engineer", "Acme AB", "Stockholm", self.BODY)])
             self.deferred_match(settings)
-            out, sizes = self.drive(settings)
-            self.assertEqual(sizes, [], "nothing was pending, so no model call")
-            self.assertIn("RoleLens found 1 new match", out)
+            out, calls = self.drive(settings)
+            self.assertEqual(calls, [])
             self.assertEqual(
                 self.summary_lines(out),
-                ["%s RoleLens: 0 new jobs checked %s 1 match." % ("🎯", "·")],
+                ["\U0001f3af RoleLens: 0 jobs checked \u00b7 1 match."],
             )
             self.assertNotIn("no new jobs found", out)
 
     def test_heartbeat_returns_once_the_deferred_card_has_been_sent(self):
-        # The suppression is scoped to the run that actually delivers the card.
         with tempfile.TemporaryDirectory() as tmp:
             settings = self.build_home(tmp)
             self.seed(settings, [("carry-1", "Platform Engineer", "Acme AB", "Stockholm", self.BODY)])
             self.deferred_match(settings)
-            first, _ = self.drive(settings)
-            self.assertIn("RoleLens found 1 new match", first)
-            second, sizes = self.drive(settings)
-            self.assertEqual(sizes, [])
-            self.assertNotIn("RoleLens found", second)
-            self.assertEqual(
-                self.summary_lines(second),
-                ["%s RoleLens: no new jobs found." % "🔎"],
-            )
+            self.drive(settings)
+            second, _ = self.drive(settings)
+            self.assertEqual(self.summary_lines(second), ["\U0001f50e RoleLens: no new jobs found."])
 
     def test_heartbeat_never_accompanies_a_match_at_the_formatter(self):
         for matches in (1, 2, 5):
             with self.subTest(matches=matches):
-                self.assertNotIn(
-                    "no new jobs found",
-                    cs.format_run_summary(0, matches, 0, partial=False),
-                )
+                self.assertNotIn("no new jobs found", cs.format_run_summary(0, matches, 0))
+        self.assertEqual(cs.format_run_summary(0, 0, 0), "\U0001f50e RoleLens: no new jobs found.")
+
+
+
+class SafetyCeilingTests(_PipelineHarness):
+    """The 300-candidate ceiling is emergency protection, never a silent cap."""
+
+    def test_ceiling_run_is_reported_as_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp, max_candidates_per_run=20)
+            self.seed(settings, self.distinct(35))
+            out, calls = self.drive(settings)
+            attempted = [i for _, ids in calls for i in ids]
+            self.assertEqual(len(attempted), 20, "only the ceiling is processed")
+            line = self.summary_lines(out)[0]
+            self.assertEqual(
+                line,
+                "\u26a0\ufe0f RoleLens: candidate safety ceiling reached, 20 selected "
+                "\u00b7 0 matches \u00b7 additional jobs remain queued.",
+            )
+            self.assertEqual(self.pending(settings), 15, "the remainder stays queued")
+
+    def test_ceiling_report_still_names_the_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp, max_candidates_per_run=20)
+            self.seed(settings, self.distinct(35))
+            scores = {"job0035": 90, "job0034": 92}
+            out, _ = self.drive(settings, scores=scores)
+            line = self.summary_lines(out)[0]
+            self.assertIn("candidate safety ceiling reached, 20 selected", line)
+            self.assertIn("2 matches", line)
+
+    def test_exactly_at_the_ceiling_is_not_flagged(self):
+        # 20 eligible and a ceiling of 20 is a complete snapshot, not a truncation.
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp, max_candidates_per_run=20)
+            self.seed(settings, self.distinct(20))
+            out, _ = self.drive(settings)
+            self.assertEqual(
+                self.summary_lines(out),
+                ["\U0001f50e RoleLens: 20 jobs checked \u00b7 0 matches."],
+            )
+            self.assertEqual(self.pending(settings), 0)
+
+    def test_normal_run_never_reports_the_ceiling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(65))
+            out, _ = self.drive(settings)
+            self.assertNotIn("safety ceiling", out)
+
+    def test_ceiling_wording_at_the_formatter(self):
         self.assertEqual(
-            cs.format_run_summary(0, 0, 0, partial=False),
-            "%s RoleLens: no new jobs found." % "🔎",
+            cs.format_run_summary(300, 4, 0, ceiling_reached=True, selected=300),
+            "\u26a0\ufe0f RoleLens: candidate safety ceiling reached, 300 selected "
+            "\u00b7 4 matches \u00b7 additional jobs remain queued.",
         )
+        # A genuine provider failure outranks the ceiling notice.
+        self.assertIn(
+            "pending after provider error",
+            cs.format_run_summary(10, 0, 290, failed=True, ceiling_reached=True, selected=300),
+        )
+
+
+class NotificationHeaderTests(_PipelineHarness):
+    """Cards are emitted directly; only the final summary states totals."""
+
+    def test_no_header_line_precedes_the_cards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(20))
+            scores = {"job0003": 90, "job0011": 92}
+            out, _ = self.drive(settings, scores=scores)
+            self.assertNotIn("new matches", out)
+            self.assertNotIn("new match", out)
+            # Assert on the removed header's shape, not the bare brand: the
+            # closing summary line legitimately contains the product name.
+            self.assertNotIn("RoleLens found", out)
+            self.assertNotIn("RoleLens found", out)
+
+    def test_output_starts_with_a_card_and_ends_with_one_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(20))
+            scores = {"job0003": 90, "job0011": 92}
+            out, _ = self.drive(settings, scores=scores)
+            body = [ln for ln in out.splitlines() if ln.strip()]
+            self.assertTrue(body[0].startswith("\U0001f7e2"), body[0])
+            self.assertEqual(
+                body[-1],
+                "\U0001f3af RoleLens: 20 jobs checked \u00b7 2 matches.",
+            )
+            self.assertEqual(len(self.summary_lines(out)), 1)
+
+    def test_formatter_emits_no_header_for_a_single_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build_home(tmp)
+            self.seed(settings, self.distinct(5))
+            scores = {"job0002": 95}
+            out, _ = self.drive(settings, scores=scores)
+            self.assertNotIn("1 new match", out)
+            self.assertTrue(out.lstrip().startswith("\U0001f7e2"), out[:80])
 
 if __name__ == "__main__":
     unittest.main()

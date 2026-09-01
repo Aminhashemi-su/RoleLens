@@ -292,12 +292,77 @@ rolelens.py
              chat delivery
 ```
 
-Bounded throughput: up to 40 candidates per run, in up to four sequential
-batches of at most ten, inside a 600-second wall-clock budget. The batch size
-stayed at ten because that is where completeness was actually validated;
-throughput came from more batches rather than bigger ones.
+A run evaluates its complete frozen snapshot in sequential batches of at most
+ten, ranks globally, and delivers once. The batch size stays at ten because that
+is where provider completeness was actually validated. How that came to be the
+invariant is the next section.
 
-## 11. What remains imperfect
+## 11. Changing the invariant: completeness over punctuality
+
+The version that came out of the benchmark work had a throughput design that
+looked responsible: up to 40 candidates per run, in at most four sequential
+batches of ten, inside a 600-second budget. Bounded, predictable, cheap. Every
+number had a defensible reason.
+
+Production data showed the reasoning was wrong, and in a way that only appears
+once real volume arrives.
+
+**The failure was ordinal, not numeric.** The pending queue is ordered by a
+cheap deterministic discovery score, which is a decent proxy for relevance and
+nothing more. On a busy day the queue exceeded the per-run cap, and everything
+past it was deferred to tomorrow. That is fine if the deferred jobs are the weak
+ones. They are not reliably: discovery score is computed before any model has
+read the advertisement, so the single strongest opportunity in a day could sit
+at position 45 and simply not be looked at. It would eventually be evaluated —
+the durable queue guarantees that — but "eventually" is the wrong word for a job
+posting with an application deadline.
+
+The bug was not in any function. It was in the product invariant.
+
+> **Old:** process up to N jobs per run.
+> **New:** evaluate the complete frozen relevant snapshot before reporting.
+
+Three things had to change together for that to be safe.
+
+**A short batch had to stop being a failure.** The old pass treated any error
+from a batch as a reason to stop the run, on the sensible-sounding grounds that
+a misbehaving provider should not burn the remaining budget. But the most common
+"error" was a schema-valid response that returned eight of ten requested IDs —
+a normal quirk of constrained generation, not a broken provider. Conflating the
+two meant one omitted ID could defer everything behind it. Splitting the outcome
+into three (`completeness`, `output`, `transport`) let the run continue through
+the first and preserve work only for the other two.
+
+**Omitted IDs needed exactly one more attempt.** Not a retry loop — one bounded
+cleanup pass over the unresolved IDs, re-batched, after the normal pass, and
+skipped entirely if the provider had already failed. Bounded and non-recursive
+was the constraint; anything else reintroduces the runaway-cost risk that the
+original cap existed to prevent.
+
+**Ranking had to move to the end.** Ranking per batch was invisible when a run
+was one or two batches; across a whole snapshot it would have delivered "the
+best of batch one" rather than "the best of today". Matches are now ranked
+globally, after every batch including cleanup, and delivered once.
+
+The old limits did not disappear — they were **demoted**. `max_candidates_per_run`
+and `max_run_seconds` are still there, raised to 300 and 3000, but they are
+emergency valves rather than throughput caps: one bounds snapshot memory, the
+other bounds wall clock. The distinction is not cosmetic. A cap silently
+truncates and reports success; a valve, when it trips, makes the run say so —
+`⚠️ RoleLens: candidate safety ceiling reached … additional jobs remain queued`.
+A partial view of the market must never be reported as a complete one.
+
+The batch stayed at ten. Nothing in this change made bigger prompts safer, and
+the benchmark evidence for completeness at that size was the one number worth
+keeping.
+
+The general lesson: **bounded execution and complete results are different
+goals, and it is easy to write code that optimises the first while believing it
+is protecting the second.** A per-run cap is an execution bound wearing the
+costume of a safety limit. The honest version bounds the expensive unit — the
+individual model call — and lets the number of units follow the work.
+
+## 12. What remains imperfect
 
 **Adjacent and specialist roles.** The weakest area by a distance. Both
 benchmarked models over-notified on roles that are adjacent to the candidate's
@@ -312,17 +377,21 @@ does not state years is genuinely unknown, and both models tend to resolve it as
 *unmet*. The policy layer converts a subset of these back to unknown, keyed on
 explicit no-evidence phrasing, but that heuristic is narrower than the problem.
 
-**Throughput and deduplication tuning.** Batch size, batch count and the
-runtime budget were chosen conservatively from a small validation set. The
-repost fingerprint is strict — employer, title, location and body must all
-match after normalization — so a reposted advertisement with a lightly reworded
-body still gets re-evaluated.
+**Deduplication tuning.** The repost fingerprint is strict — employer, title,
+location and body must all match after normalization — so a reposted
+advertisement with a lightly reworded body still gets re-evaluated and costs a
+model call.
+
+**The emergency valves are untested at their limits.** A snapshot large enough
+to trip the 300-candidate ceiling or the 3000-second budget has not occurred in
+production. The behaviour is covered by tests, but tests are not the same as
+having seen it happen.
 
 **The candidate's language level is in the code.** The Swedish CEFR level appears
 in the system prompt and the policy layer rather than being read from the
 profile. It works for one installation and is wrong as a general design.
 
-## 12. Lessons learned
+## 13. Lessons learned
 
 **Derive state, do not store it.** The absence of an evaluation row is a better
 pending queue than a status column, because it cannot be updated incorrectly.
@@ -350,3 +419,14 @@ bugs that scoring model output alone would have carried into deployment.
 **Make quiet runs loud.** A tool that prints nothing when nothing matched is
 indistinguishable from a tool that is broken. One summary line per run is the
 cheapest observability in the entire system.
+
+**Do not warn about normal operation.** The same summary line originally
+reported every unprocessed job as `pending retry`, warning icon included, on
+runs where nothing had gone wrong at all. A warning that fires during healthy
+operation is a warning that gets ignored, which costs you the one that matters.
+Healthy queued work and provider failures now read differently on purpose.
+
+**Bounded execution is not the same goal as complete results.** A per-run job
+cap looks like a safety limit and behaves like an execution bound. Bound the
+expensive unit — the individual model call — and let the number of units follow
+the work.

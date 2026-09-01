@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 APP_NAME = "rolelens"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 SCHEMA_VERSION = "2"
 DEFAULT_HOME = Path.home() / ".rolelens"
 JOBSEARCH_BASE_URL = "https://jobsearch.api.jobtechdev.se"
@@ -117,7 +117,6 @@ class Settings:
     query_delay_seconds: float
     max_candidates_per_run: int
     max_jobs_per_batch: int
-    max_batches_per_run: int
     max_run_seconds: int
     max_prompt_chars: int
     max_job_description_chars: int
@@ -165,12 +164,12 @@ class Settings:
             include_unlocated_searches=bool(raw.get("include_unlocated_searches", True)),
             search_limit=min(100, positive_int("search_limit", 50)),
             query_delay_seconds=max(0.0, float(raw.get("query_delay_ms", 120)) / 1000.0),
-            # The batch stays at 10 because Gemini completeness was validated at
-            # that size. Throughput comes from several sequential batches instead.
-            max_candidates_per_run=min(200, positive_int("max_candidates_per_run", 40)),
+            # Completeness beats punctuality: a run evaluates its whole frozen
+            # snapshot. The two limits below are emergency valves, not throughput
+            # caps - one bounds snapshot memory, the other bounds wall clock.
+            max_candidates_per_run=min(500, positive_int("max_candidates_per_run", 300)),
             max_jobs_per_batch=min(10, positive_int("max_jobs_per_batch", 10)),
-            max_batches_per_run=min(10, positive_int("max_batches_per_run", 4)),
-            max_run_seconds=positive_int("max_run_seconds", 600),
+            max_run_seconds=positive_int("max_run_seconds", 3000),
             max_prompt_chars=positive_int("max_prompt_chars", 180_000),
             max_job_description_chars=positive_int("max_job_description_chars", 9_000),
             max_notifications_per_run=positive_int("max_notifications_per_run", 8),
@@ -270,7 +269,11 @@ class RunStats:
     total_tokens: int = 0
     fallback_calls: int = 0
     batches_processed: int = 0
+    cleanup_batches: int = 0
     duplicates_suppressed: int = 0
+    snapshot_size: int = 0
+    unresolved: int = 0
+    deferred: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -281,6 +284,10 @@ class ProviderBatchResult:
     unresolved_ids: frozenset[str]
     usage: dict[str, int]
     error: str | None = None
+    # "output"       the envelope could not be parsed at all
+    # "completeness" the envelope was fine, some requested IDs came back missing
+    # "transport"    both providers failed to answer
+    error_kind: str | None = None
 
 
 class FileLock:
@@ -979,9 +986,11 @@ def parse_provider_evaluations(
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as exc:
-        return ProviderBatchResult(provider, model, (), frozenset(expected_ids), usage, f"invalid JSON: {compact_sentence(exc, 160)}")
+        return ProviderBatchResult(provider, model, (), frozenset(expected_ids), usage,
+                                   f"invalid JSON: {compact_sentence(exc, 160)}", "output")
     if not isinstance(parsed, dict) or not isinstance(parsed.get("evaluations"), list):
-        return ProviderBatchResult(provider, model, (), frozenset(expected_ids), usage, "response missing evaluations array")
+        return ProviderBatchResult(provider, model, (), frozenset(expected_ids), usage,
+                                   "response missing evaluations array", "output")
 
     raw_items = parsed["evaluations"]
     counts: dict[str, int] = {}
@@ -1026,6 +1035,9 @@ def parse_provider_evaluations(
         unresolved_ids=frozenset(unresolved),
         usage=usage,
         error="; ".join(errors) if errors else None,
+        # The envelope parsed, so anything left over is a completeness gap. That
+        # is a normal Gemini quirk and must never be read as a provider failure.
+        error_kind="completeness" if errors else None,
     )
 
 
@@ -1110,7 +1122,8 @@ class ProviderMatcher:
             else:
                 content, usage = extract_azure_response(response)
         except ModelOutputError as exc:
-            return ProviderBatchResult(self.provider, self.model, (), expected_ids, exc.usage, compact_sentence(exc, 500))
+            return ProviderBatchResult(self.provider, self.model, (), expected_ids, exc.usage,
+                                       compact_sentence(exc, 500), "output")
 
         result = parse_provider_evaluations(content, jobs, provider=self.provider, model=self.model, usage=usage)
         archive_model_response(self.settings, self.provider, content, failure=bool(result.error))
@@ -1140,7 +1153,86 @@ def evaluate_with_fallback(
                 unresolved_ids=expected_ids,
                 usage=empty_usage(),
                 error=error,
+                error_kind="transport",
             ), True
+
+
+@dataclasses.dataclass
+class BatchPassResult:
+    """Outcome of one sequential pass over a fixed list of batches."""
+
+    unresolved: list[sqlite3.Row] = dataclasses.field(default_factory=list)
+    deferred: list[sqlite3.Row] = dataclasses.field(default_factory=list)
+    provider_error: str | None = None
+
+
+def run_batch_pass(
+    db: "Database",
+    primary: "ProviderMatcher",
+    fallback: "ProviderMatcher",
+    batches: Sequence[Sequence[sqlite3.Row]],
+    *,
+    profile_version: str,
+    stats: RunStats,
+    deadline: float,
+    reserve_seconds: int,
+    cleanup: bool = False,
+) -> BatchPassResult:
+    """Evaluate every batch once, in order.
+
+    A short batch is a completeness gap, not a failure: the valid rows are
+    saved, the missing IDs are collected, and processing continues. Only an
+    unparseable envelope or both providers failing stops the pass, and whatever
+    was never attempted comes back so the caller can report it as pending.
+    """
+    outcome = BatchPassResult()
+    for index, batch in enumerate(batches):
+        remaining = [row for later in batches[index:] for row in later]
+        # Start a batch only when its worst case still fits the emergency budget.
+        if index and time.monotonic() + reserve_seconds > deadline:
+            LOG.warning("Emergency runtime budget reached; %d job(s) left pending", len(remaining))
+            outcome.deferred.extend(remaining)
+            return outcome
+
+        result, used_fallback = evaluate_with_fallback(primary, fallback, batch)
+        if cleanup:
+            stats.cleanup_batches += 1
+        else:
+            stats.batches_processed += 1
+        stats.fallback_calls += int(used_fallback)
+        add_provider_usage(stats, result.usage)
+
+        by_source_id = {str(row["source_job_id"]): row for row in batch}
+        for evaluation in result.evaluations:
+            row = by_source_id.get(evaluation.source_job_id)
+            if row is None:
+                continue
+            db.save_evaluation(
+                row, evaluation, profile_version=profile_version,
+                model=f"{result.provider}:{result.model}",
+            )
+            stats.evaluated += 1
+
+        if result.error_kind in {"output", "transport"}:
+            # The provider did not answer usably at all. Preserve this batch and
+            # everything after it rather than hammer something that is broken.
+            LOG.warning(
+                "%s failure on batch %d via %s: %s",
+                result.error_kind, index + 1, result.provider,
+                compact_sentence(result.error or "", 300),
+            )
+            outcome.provider_error = result.error
+            outcome.deferred.extend(remaining)
+            return outcome
+
+        missing = [by_source_id[x] for x in sorted(result.unresolved_ids) if x in by_source_id]
+        if missing:
+            LOG.info(
+                "Batch %d returned %d of %d; %d ID(s) unresolved",
+                index + 1, len(result.evaluations), len(batch), len(missing),
+            )
+            outcome.unresolved.extend(missing)
+    return outcome
 
 
 def iso_now() -> str:
@@ -1914,7 +2006,9 @@ def persist_discovered_jobs(
 def format_notifications(rows: Sequence[sqlite3.Row]) -> str:
     if not rows:
         return ""
-    lines = [f"🔎 RoleLens found {len(rows)} new match{'es' if len(rows) != 1 else ''}\n"]
+    # No header: the cards speak for themselves and the run summary that
+    # follows already states the totals.
+    lines: list[str] = []
     for index, row in enumerate(rows, start=1):
         decision_icon = {
             "notify_strong": "🟢",
@@ -2013,25 +2107,45 @@ def add_provider_usage(stats: RunStats, usage: Mapping[str, int]) -> None:
     stats.total_tokens += int(usage.get("total_tokens") or (prompt + completion))
 
 
-def format_run_summary(evaluated: int, matches: int, pending_retry: int, *, partial: bool) -> str:
+def format_run_summary(
+    evaluated: int,
+    matches: int,
+    queued: int = 0,
+    *,
+    failed: bool = False,
+    ceiling_reached: bool = False,
+    selected: int = 0,
+) -> str:
     """One compact stats line per run.
 
-    `evaluated` counts jobs the semantic matcher actually returned results for,
-    never Platsbanken search hits or database upserts.
+    `evaluated` counts jobs the semantic matcher returned a usable result for,
+    never Platsbanken search hits or database upserts. `queued` counts frozen
+    snapshot jobs that ended the run without one and will be retried next time.
     """
     noun = "match" if matches == 1 else "matches"
-    if partial:
+    if failed:
         return (
-            f"⚠️ RoleLens: {evaluated} jobs checked · {matches} {noun} "
-            f"· {pending_retry} pending retry."
+            f"\u26a0\ufe0f RoleLens: {evaluated} jobs checked \u00b7 {matches} {noun} "
+            f"\u00b7 {queued} pending after provider error."
         )
-    if evaluated == 0 and matches == 0:
-        # Only a genuinely empty tick reports nothing; a match carried over from an
-        # earlier run must still be described accurately.
-        return "🔎 RoleLens: no new jobs found."
-    icon = "🎯" if matches else "🔎"
-    return f"{icon} RoleLens: {evaluated} new jobs checked · {matches} {noun}."
-
+    if ceiling_reached:
+        # The snapshot was truncated by the emergency ceiling, so this run is not a
+        # complete picture of the market and must never be reported as one.
+        return (
+            f"\u26a0\ufe0f RoleLens: candidate safety ceiling reached, {selected} selected "
+            f"\u00b7 {matches} {noun} \u00b7 additional jobs remain queued."
+        )
+    if evaluated == 0 and matches == 0 and queued == 0:
+        # Only a genuinely empty tick reports nothing; a match carried over from
+        # an earlier run must still be described accurately.
+        return "\U0001f50e RoleLens: no new jobs found."
+    icon = "\U0001f3af" if matches else "\U0001f50e"
+    if queued:
+        return (
+            f"{icon} RoleLens: {evaluated} jobs checked \u00b7 {matches} {noun} "
+            f"\u00b7 {queued} queued for next run."
+        )
+    return f"{icon} RoleLens: {evaluated} jobs checked \u00b7 {matches} {noun}."
 
 def determine_run_status(partial_reasons: Sequence[str]) -> str:
     return "partial" if partial_reasons else "success"
@@ -2063,37 +2177,49 @@ def run_pipeline(settings: Settings, *, fetch_only: bool, evaluate_only: bool) -
                 stats.jobs_prefiltered,
             )
 
+        ceiling_reached = False
+        snapshot_selected = 0
         if not fetch_only:
             matcher_profile, matcher_rules, version = load_profile_bundle(settings)
             secrets = load_secrets(settings.secrets_path)
-            candidates = db.pending_jobs(version, settings.max_candidates_per_run)
 
-            kept, duplicate_candidates = suppress_duplicate_candidates(db, candidates)
+            # Freeze the candidate set for this run. It is taken once and never
+            # re-queried, so a job discovered mid-run belongs to the next run and
+            # this run stays auditable.
+            ceiling = settings.max_candidates_per_run
+            candidates = db.pending_jobs(version, ceiling)
+            eligible_total = db.pending_count(version, respect_live_mode=True)
+            # The ceiling is emergency protection, never a throughput limit. When it
+            # bites, the run is explicitly incomplete rather than quietly truncated.
+            ceiling_reached = len(candidates) >= ceiling and eligible_total > ceiling
+            if ceiling_reached:
+                LOG.warning(
+                    "Candidate safety ceiling reached: %d of %d eligible job(s) selected; "
+                    "the remainder stays queued",
+                    len(candidates), eligible_total,
+                )
+            snapshot, duplicate_candidates = suppress_duplicate_candidates(db, candidates)
             stats.duplicates_suppressed = len(duplicate_candidates)
+            stats.snapshot_size = len(snapshot)
             for row, canonical in duplicate_candidates:
                 LOG.info(
                     "Repost suppressed before evaluation: %s is a repost of job %d",
-                    row["source_job_id"],
-                    canonical,
+                    row["source_job_id"], canonical,
                 )
 
-            batches: list[list[sqlite3.Row]] = []
-            for candidate_batch in iter_batches(
-                kept,
-                max_jobs=settings.max_jobs_per_batch,
-                max_chars=settings.max_prompt_chars,
-                max_job_description_chars=settings.max_job_description_chars,
-            ):
-                if len(batches) >= settings.max_batches_per_run:
-                    break
-                batches.append(candidate_batch)
-
-            stats.pending_selected = sum(len(x) for x in batches)
+            batches = list(
+                iter_batches(
+                    snapshot,
+                    max_jobs=settings.max_jobs_per_batch,
+                    max_chars=settings.max_prompt_chars,
+                    max_job_description_chars=settings.max_job_description_chars,
+                )
+            )
+            stats.pending_selected = len(snapshot)
+            snapshot_selected = len(candidates)
             LOG.info(
-                "Selected %d job(s) across %d batch(es); %d repost(s) suppressed",
-                stats.pending_selected,
-                len(batches),
-                stats.duplicates_suppressed,
+                "Frozen snapshot: %d candidate(s) in %d batch(es); %d repost(s) suppressed",
+                len(snapshot), len(batches), stats.duplicates_suppressed,
             )
 
             if batches:
@@ -2103,50 +2229,49 @@ def run_pipeline(settings: Settings, *, fetch_only: bool, evaluate_only: bool) -
                 fallback = ProviderMatcher(
                     settings, secrets, matcher_profile, matcher_rules, settings.fallback_provider
                 )
-                run_deadline = time.monotonic() + settings.max_run_seconds
+                deadline = time.monotonic() + settings.max_run_seconds
+                reserve = settings.gateway_timeout_seconds
 
-                for index, batch in enumerate(batches):
-                    # Only start a batch when its worst case still fits the budget.
-                    if index and time.monotonic() + settings.gateway_timeout_seconds > run_deadline:
-                        left = sum(len(x) for x in batches[index:])
-                        partial_reasons.append(
-                            f"runtime budget reached after {index} batch(es); {left} job(s) left pending"
+                outcome = run_batch_pass(
+                    db, primary, fallback, batches,
+                    profile_version=version, stats=stats,
+                    deadline=deadline, reserve_seconds=reserve,
+                )
+
+                # Completeness matters more than punctuality, so unresolved IDs get
+                # exactly one more attempt after the normal pass. Never recursive.
+                if outcome.unresolved and outcome.provider_error is None:
+                    cleanup_batches = list(
+                        iter_batches(
+                            outcome.unresolved,
+                            max_jobs=settings.max_jobs_per_batch,
+                            max_chars=settings.max_prompt_chars,
+                            max_job_description_chars=settings.max_job_description_chars,
                         )
-                        LOG.warning("Runtime budget reached; %d job(s) remain pending", left)
-                        break
+                    )
+                    LOG.info(
+                        "Cleanup pass: retrying %d unresolved ID(s) in %d batch(es)",
+                        len(outcome.unresolved), len(cleanup_batches),
+                    )
+                    cleanup = run_batch_pass(
+                        db, primary, fallback, cleanup_batches,
+                        profile_version=version, stats=stats,
+                        deadline=deadline, reserve_seconds=reserve, cleanup=True,
+                    )
+                    outcome.unresolved = cleanup.unresolved + cleanup.deferred
+                    if cleanup.provider_error:
+                        outcome.provider_error = cleanup.provider_error
+                elif outcome.unresolved:
+                    LOG.info("Skipping cleanup pass: the provider already failed this run")
 
-                    result, used_fallback = evaluate_with_fallback(primary, fallback, batch)
-                    stats.batches_processed += 1
-                    stats.fallback_calls += int(used_fallback)
-                    add_provider_usage(stats, result.usage)
-                    unresolved_count += len(result.unresolved_ids)
-
-                    by_source_id = {str(row["source_job_id"]): row for row in batch}
-                    for evaluation in result.evaluations:
-                        row = by_source_id.get(evaluation.source_job_id)
-                        if row is None:
-                            continue
-                        db.save_evaluation(
-                            row,
-                            evaluation,
-                            profile_version=version,
-                            model=f"{result.provider}:{result.model}",
-                        )
-                        stats.evaluated += 1
-
-                    if result.error:
-                        # No semantic retry. Stop here so a failing provider cannot
-                        # burn the remaining budget; untouched jobs stay pending.
-                        left = sum(len(x) for x in batches[index + 1:])
-                        partial_reasons.append(result.error)
-                        LOG.warning(
-                            "Semantic batch %d partial via %s: %s; %d job(s) left pending",
-                            index + 1,
-                            result.provider,
-                            compact_sentence(result.error, 300),
-                            left,
-                        )
-                        break
+                queued_rows = outcome.unresolved + outcome.deferred
+                stats.unresolved = len(outcome.unresolved)
+                stats.deferred = len(outcome.deferred)
+                unresolved_count = len(queued_rows)
+                if outcome.provider_error:
+                    partial_reasons.append(outcome.provider_error)
+                for row in queued_rows:
+                    LOG.info("Still pending after this run: %s", row["source_job_id"])
 
             remaining_live = db.pending_count(version, respect_live_mode=True)
             notification_rows = db.unnotified(settings.max_notifications_per_run)
@@ -2178,10 +2303,11 @@ def run_pipeline(settings: Settings, *, fetch_only: bool, evaluate_only: bool) -
                 format_run_summary(
                     stats.evaluated,
                     stats.notified,
-                    # Everything selected but not evaluated stays pending: provider
-                    # omissions, a failed batch, and batches never started.
+                    # Frozen-snapshot jobs that ended the run without a result.
                     max(0, stats.pending_selected - stats.evaluated),
-                    partial=bool(partial_reasons),
+                    failed=bool(partial_reasons),
+                    ceiling_reached=ceiling_reached,
+                    selected=snapshot_selected,
                 ),
                 flush=True,
             )

@@ -2,10 +2,61 @@
 
 RoleLens was developed under an earlier internal name before this repository
 existed, so V1.1–V1.4 have no individual Git commits. This file records the
-known major versions instead. Version 1.5.1 is the first state captured in Git.
+known major versions instead. Version 1.5.1 is the first state captured in
+Git; 1.5.2 is the current release.
 
 The format is loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project does not follow strict semantic versioning.
+
+## [1.5.2] — 2026-09-01
+
+Completeness over punctuality.
+
+### Changed
+- **Processes the complete frozen candidate snapshot before delivery.** The
+  invariant moved from "process up to N jobs per run" to "evaluate the complete
+  frozen relevant snapshot before reporting". The candidate set is taken once
+  per run and never re-queried, so a vacancy discovered mid-run belongs to the
+  next run and this run stays auditable.
+- **Keeps semantic request batches at 10.** Batch size stays small and bounded
+  because that is where provider completeness was validated; throughput now
+  comes from running as many sequential batches as the snapshot needs.
+- **Removes the per-run throughput cap.** `max_batches_per_run` is gone.
+  `max_candidates_per_run` (default 300, cap 500) and `max_run_seconds`
+  (default 3000) are emergency valves, not throughput caps: one bounds snapshot
+  memory, the other bounds wall clock.
+- **Globally ranks matches after all batches complete.** Delivery happens only
+  once semantic processing has finished, so the strongest opportunity is
+  reported first regardless of which batch produced it.
+- **Separates healthy queued work from provider failures.** The run summary now
+  distinguishes `N queued for next run` from `N pending after provider error`.
+- **Removes the redundant match header** in favour of the single closing
+  RoleLens summary line. The cards already speak for themselves.
+
+### Added
+- **One bounded cleanup pass** for IDs a provider omitted, run once after the
+  normal pass in fresh batches. Never recursive, and skipped entirely if the
+  provider already failed during this run.
+- **Explicit candidate and runtime safety limits.** When the candidate ceiling
+  truncates a snapshot the run says so in its summary, because a partial view of
+  the market must never be reported as a complete one.
+- Internal `error_kind`, separating three outcomes that were previously
+  conflated: `output` (envelope unparseable), `completeness` (envelope fine,
+  some requested IDs missing) and `transport` (both providers failed).
+- 20 new tests (53 → 73) covering snapshot completeness, completeness gaps,
+  transport failure, ranking and delivery ordering, the runtime budget and the
+  safety ceiling.
+
+### Fixed
+- **Continues after incomplete but usable provider responses.** A short batch no
+  longer aborts the batches after it: its valid rows are saved and processing
+  continues. Only an unparseable envelope or both providers failing stops a pass.
+
+### Upgrading
+- Remove `max_batches_per_run` from your `config.json`; it is no longer read.
+- Raise your scheduler's per-task timeout above `max_run_seconds` plus one
+  `gateway_timeout_seconds` of reserve — at least 3600 seconds with the
+  defaults. See the README.
 
 ## [1.5.1] — 2026-09-01
 
