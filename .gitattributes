@@ -1,0 +1,16 @@
+# RoleLens ships a shell installer and a Python script that run on Linux.
+# CRLF line endings break both, so normalise everything to LF in the repository
+# and check it out as LF regardless of platform.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.sh    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.env   text eol=lf
+LICENSE text eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
+*.db  binary

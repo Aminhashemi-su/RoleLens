@@ -1,0 +1,160 @@
+{
+  "schema_version": "3",
+  "purpose": "Retrieval strategy for the discovery pass. RoleLens does not send this file to a model; it documents the intent behind config.json search_terms and location_terms. THIS IS A SYNTHETIC EXAMPLE.",
+  "retrieval_strategy": {
+    "principle": "Search broadly, filter conservatively, let semantic matching decide.",
+    "false_negative_policy": "Prefer retrieving a somewhat irrelevant ad over missing a hidden-fit role.",
+    "title_rule": "Never require an exact title match."
+  },
+  "lenses": [
+    {
+      "name": "ai_product_builder",
+      "priority": "high",
+      "title_seeds": [
+        "AI Product Engineer",
+        "Applied AI Engineer",
+        "AI Engineer",
+        "AI Software Engineer",
+        "AI Application Engineer",
+        "LLM Engineer"
+      ],
+      "capability_terms": [
+        "LLM",
+        "AI agents",
+        "RAG",
+        "AI applications",
+        "AI workflows",
+        "model integration",
+        "human in the loop"
+      ],
+      "problem_patterns": [
+        "build AI features into products",
+        "take AI prototypes to production",
+        "integrate models into workflows",
+        "evaluate model output reliability"
+      ]
+    },
+    {
+      "name": "product_full_stack",
+      "priority": "high",
+      "title_seeds": [
+        "Product Engineer",
+        "Full Stack Engineer",
+        "Fullstackutvecklare",
+        "Software Engineer",
+        "Systemutvecklare"
+      ],
+      "capability_terms": [
+        "React",
+        "TypeScript",
+        "Python",
+        "FastAPI",
+        "PostgreSQL",
+        "REST API",
+        "end to end ownership"
+      ],
+      "problem_patterns": [
+        "own a feature from discovery to production",
+        "work directly with users",
+        "small team, broad responsibility"
+      ]
+    },
+    {
+      "name": "customer_facing_engineering",
+      "priority": "medium",
+      "title_seeds": [
+        "Solutions Engineer",
+        "Implementation Engineer",
+        "Forward Deployed Engineer",
+        "Customer Engineer",
+        "Integration Engineer"
+      ],
+      "capability_terms": [
+        "customer integrations",
+        "technical onboarding",
+        "solution design",
+        "API integration",
+        "pre-sales engineering"
+      ],
+      "problem_patterns": [
+        "deploy the product inside a customer environment",
+        "translate customer requirements into configuration or code",
+        "support enterprise rollouts technically"
+      ]
+    },
+    {
+      "name": "automation_and_business_systems",
+      "priority": "medium",
+      "title_seeds": [
+        "Automation Engineer",
+        "Business Systems Engineer",
+        "Process Automation Developer",
+        "Integrationsutvecklare"
+      ],
+      "capability_terms": [
+        "workflow automation",
+        "internal tooling",
+        "systems integration",
+        "data plumbing"
+      ],
+      "problem_patterns": [
+        "replace manual operational work with software",
+        "connect internal systems that do not talk to each other"
+      ]
+    },
+    {
+      "name": "adjacent_analysis",
+      "priority": "low",
+      "title_seeds": [
+        "Technical Business Analyst",
+        "Kravanalytiker",
+        "Requirements Engineer"
+      ],
+      "capability_terms": [
+        "requirements",
+        "stakeholder interviews",
+        "process mapping"
+      ],
+      "problem_patterns": [
+        "define what should be built before it is built"
+      ]
+    }
+  ],
+  "swedish_search_expansions": {
+    "titles_and_terms": [
+      "systemutvecklare",
+      "fullstackutvecklare",
+      "mjukvaruutvecklare",
+      "backendutvecklare",
+      "frontendutvecklare",
+      "integrationsutvecklare",
+      "kravanalytiker",
+      "IT-konsult",
+      "produktutvecklare",
+      "automation",
+      "digitalisering"
+    ],
+    "rule": "Search Swedish terminology even when the candidate is not fluent. Language fit is judged later, by the evaluator and the policy layer."
+  },
+  "geography_queries": {
+    "primary": ["Stockholm", "Solna", "Sundbyberg"],
+    "secondary": ["Göteborg", "Malmö", "Uppsala"],
+    "tertiary": ["Linköping", "Västerås"],
+    "broad": ["Sverige", "remote", "distans"],
+    "exclude_for_physical_roles": ["Kiruna", "Luleå"]
+  },
+  "retrieval_exclusions": {
+    "hard_or_near_hard": [
+      "roles explicitly requiring security-clearance or citizenship conditions the candidate cannot meet, only when confirmed",
+      "unpaid positions unless explicitly reconsidered later"
+    ],
+    "soft_only": [
+      "Swedish preferred",
+      "slightly higher years-of-experience requirement",
+      "unfamiliar job title",
+      "part-time",
+      "student position",
+      "remote"
+    ]
+  }
+}

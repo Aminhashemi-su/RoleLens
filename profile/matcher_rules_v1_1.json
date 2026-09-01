@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.1",
+  "purpose": "Compact daily semantic-matching contract for RoleLens.",
+  "score_model": {
+    "career_fit": {
+      "meaning": "How well this kind of work matches the candidate's evidence-backed capabilities, independent of vacancy-specific blockers.",
+      "range": "0-100"
+    },
+    "opportunity_score": {
+      "meaning": "How worthwhile this exact vacancy is to pursue now, after mandatory requirements, seniority, language and practical constraints.",
+      "range": "0-100"
+    }
+  },
+  "evaluation_order": [
+    "Verify vacancy appears active/open before spending LLM tokens.",
+    "Ignore title initially.",
+    "Infer actual day-to-day work and problems to solve.",
+    "Compute career_fit from responsibilities and evidence.",
+    "Extract every explicit must-have and classify candidate status as met, partial, unmet, or unknown.",
+    "Apply language, seniority, domain, degree, clearance and location effects to opportunity_score.",
+    "Never convert unknown security/citizenship eligibility into an automatic rejection.",
+    "Return concise evidence-based reasons and gaps."
+  ],
+  "requirement_states": [
+    "met",
+    "partial",
+    "unmet",
+    "unknown"
+  ],
+  "blocker_types": {
+    "hard": "Confirmed mandatory requirement the candidate does not meet.",
+    "strong": "Material mismatch that sharply reduces interview likelihood but may not be absolute.",
+    "unknown": "Potential blocker requiring verification, such as role-specific security-clearance citizenship rules."
+  },
+  "notification_logic": {
+    "notify_strong": "opportunity_score >= 85",
+    "notify_good": "70 <= opportunity_score < 85",
+    "notify_stretch": "60 <= opportunity_score < 70",
+    "notify_verify": "career_fit >= 85 and opportunity_score >= 55 and the main penalty is an unknown blocker",
+    "store_no_notify": "otherwise",
+    "exception": "Do not notify a closed/expired vacancy regardless of score."
+  },
+  "language_rules": {
+    "swedish_preferred": "minor penalty only",
+    "ad_written_in_swedish": "no penalty by itself",
+    "professional_or_fluent_swedish_required": "strong penalty when the candidate's Swedish is below professional working proficiency",
+    "english_only": "no penalty"
+  },
+  "experience_rules": {
+    "slightly_above_candidate": "penalize, do not auto-reject",
+    "4_plus_years_with_strong_semantic_fit": "usually keep discoverable as a stretch/good opportunity depending on other gaps",
+    "5_plus_years_plus_specialist_stack_gap": "large opportunity penalty",
+    "founder_or_cto_title": "never use title alone to satisfy seniority"
+  },
+  "required_output": [
+    "career_fit",
+    "opportunity_score",
+    "actual_role",
+    "why_fit",
+    "candidate_evidence",
+    "must_have_assessment",
+    "gaps",
+    "blockers",
+    "language_risk",
+    "seniority_risk",
+    "location_note",
+    "decision",
+    "url"
+  ]
+}

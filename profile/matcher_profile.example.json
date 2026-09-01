@@ -1,0 +1,104 @@
+{
+  "schema_version": "1.0",
+  "purpose": "Compact daily semantic-matching profile. Designed to be sent to an LLM repeatedly with low token overhead. THIS IS A SYNTHETIC EXAMPLE CANDIDATE.",
+  "candidate_core": "Alex Lindqvist is an AI/full-stack product engineer who ships user-facing software end to end: discovery with real users, API and data modelling, front end, deployment and iteration. Four years of professional experience, currently building LLM-backed workflow features on a B2B SaaS product. Comfortable owning ambiguous problems and translating operational needs into product decisions. Based in Stockholm, works in English, learning Swedish.",
+  "differentiators": [
+    "Ships complete features rather than isolated tickets: schema, API, UI, deploy, measure.",
+    "Has taken LLM features from prototype to production, including evaluation and cost control.",
+    "Talks to customers directly and turns vague operational pain into scoped product work.",
+    "Comfortable with ambiguity and small teams where the role is not fully defined.",
+    "Writes and maintains the tests and observability for the code they ship.",
+    "Reads and reasons about Swedish job advertisements even though the working language is English."
+  ],
+  "strong_capabilities": [
+    "Python backend and API development (FastAPI)",
+    "TypeScript and React front-end product work",
+    "Relational data modelling with PostgreSQL",
+    "LLM application engineering: prompting, structured output, evaluation harnesses",
+    "Turning ambiguous requirements into shippable product increments",
+    "Cloud deployment of small services (containers, managed platforms)",
+    "Integration work against third-party and internal HTTP APIs",
+    "Automated testing and CI for application code",
+    "Customer-facing technical communication in English",
+    "Debugging production issues across the whole stack"
+  ],
+  "secondary_capabilities": [
+    "Basic data pipeline work and scheduled batch jobs",
+    "Light infrastructure-as-code for application deployment",
+    "Analytics instrumentation and product metrics",
+    "Technical writing and internal documentation",
+    "Code review and mentoring of interns",
+    "Introductory security hygiene for web applications"
+  ],
+  "technology_evidence": [
+    "Python", "FastAPI", "SQLAlchemy", "pytest",
+    "TypeScript", "JavaScript", "React", "Next.js", "Vite",
+    "PostgreSQL", "SQLite", "Redis",
+    "REST APIs", "JSON Schema", "OpenAPI",
+    "LLM APIs and structured output", "retrieval over document sets", "prompt evaluation harnesses",
+    "Docker", "GitHub Actions", "Linux", "Nginx",
+    "AWS (App Runner, S3, RDS)", "Terraform (basic)",
+    "Git", "Playwright"
+  ],
+  "education_signal": "BSc in Computer Science from a Swedish university, completed 2022. Coursework in algorithms, databases, distributed systems and machine learning. Degree is relevant but not the strongest signal; production delivery experience is. Treat a 'BSc or equivalent experience' requirement as met.",
+  "role_families_to_recognize_semantically": [
+    "AI Product Engineering",
+    "Applied AI / AI Application Engineering",
+    "Product-oriented Full-Stack Engineering",
+    "Software/Product Engineering",
+    "Solutions Engineering",
+    "Implementation Engineering",
+    "Forward-Deployed / Customer Engineering",
+    "AI Automation / Intelligent Workflow Engineering",
+    "Business Systems / Process Automation",
+    "Requirements / Systems Analysis",
+    "Technical Business Analysis",
+    "Implementation-oriented Technology Consulting",
+    "Selected technical product roles"
+  ],
+  "important_cautions": [
+    "Do not infer staff/principal engineering seniority from a small-team title.",
+    "Do not claim ML research or data-science specialization; the evidence is application engineering.",
+    "Do not claim fluent Swedish. Current Swedish is A2 and progressing.",
+    "Do not claim Kubernetes/SRE/security specialization unless the ad only needs adjacent familiarity.",
+    "Do not treat early freelance web work as the candidate's current professional ceiling."
+  ],
+  "constraints": {
+    "location": "Sweden",
+    "location_preference": "Stockholm preferred; Göteborg and Malmö acceptable; elsewhere only if fully remote.",
+    "exclude_physical_locations": "On-site roles far from the preferred regions.",
+    "remote": "Hybrid or remote preferred, on-site acceptable in Stockholm.",
+    "work_style": "Small product teams with direct user contact.",
+    "employment": "Permanent employment preferred; long consulting engagements considered.",
+    "swedish": "A2, progressing",
+    "work_eligibility": "Holds the right to work in Sweden. Citizenship and security-clearance eligibility are unknown and must never be assumed."
+  },
+  "matching_instruction": "Judge what the person would actually do day to day, not the advertised title. Score career_fit purely on the work and the evidence. Put language, seniority, location, citizenship and clearance effects into opportunity_score and blockers. Never convert an unknown fact into an unmet requirement.",
+  "score_dimensions": {
+    "actual_work_and_responsibility_fit": 30,
+    "evidence_backed_capability_fit": 25,
+    "problem_and_product_environment_fit": 20,
+    "seniority_realism": 15,
+    "practical_constraints": 10
+  },
+  "notification_threshold": 60,
+  "score_bands": {
+    "85-100": "strong_match",
+    "70-84": "good_match",
+    "60-69": "possible_match",
+    "0-59": "do_not_notify"
+  },
+  "required_evaluation_output": [
+    "score",
+    "confidence",
+    "actual_role",
+    "fit_reasons",
+    "candidate_evidence",
+    "gaps",
+    "why_not_higher",
+    "language_risk",
+    "location_preference_note",
+    "decision",
+    "url"
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "primary_provider": "vertex_gemini",
+  "fallback_provider": "azure_gpt5mini",
+  "database": "data/rolelens.db",
+  "profile_dir": "profile",
+  "secrets_file": "secrets.env",
+  "lock_file": "data/rolelens.lock",
+
+  "search_terms": [
+    "AI engineer",
+    "product engineer",
+    "full stack",
+    "software engineer",
+    "solutions engineer",
+    "implementation engineer",
+    "forward deployed",
+    "systemutvecklare"
+  ],
+  "location_terms": [
+    "Stockholm",
+    "Göteborg",
+    "Malmö"
+  ],
+  "include_unlocated_searches": true,
+  "search_limit": 50,
+  "query_delay_ms": 120,
+
+  "max_candidates_per_run": 40,
+  "max_jobs_per_batch": 10,
+  "max_batches_per_run": 4,
+  "max_run_seconds": 600,
+  "max_prompt_chars": 180000,
+  "max_job_description_chars": 9000,
+  "max_notifications_per_run": 8,
+
+  "jobsearch_timeout_seconds": 30,
+  "gateway_timeout_seconds": 150,
+  "http_retries": 4,
+
+  "preferred_locations": [
+    "Stockholm",
+    "Göteborg",
+    "Malmö"
+  ],
+  "northern_exclusions": [
+    "Kiruna",
+    "Norrbottens län"
+  ],
+  "high_signal_title_terms": [
+    "product engineer",
+    "ai engineer",
+    "solutions engineer",
+    "implementation engineer",
+    "forward deployed",
+    "full stack",
+    "systemutvecklare"
+  ]
+}

@@ -1,0 +1,63 @@
+# ---------------------------------------------------------------
+# RoleLens — your own configuration and data stay out of Git.
+# ---------------------------------------------------------------
+
+# Secrets
+.env
+.env.*
+secrets.env
+*.pem
+*.key
+
+# Your real configuration and profile.
+# The repository ships *.example.json; copy them, then edit the copies.
+config.json
+profile/career_profile.json
+profile/matcher_profile.json
+profile/search_lenses.json
+
+# Databases and durable runtime state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+data/
+*.lock
+
+# Runtime artifacts and provider archives
+logs/
+*.log
+last_*_response.txt
+model_failures/
+
+# Benchmark output, including raw provider responses and any job corpus
+benchmark_results/
+**/raw/
+
+# Backups
+backups/
+rolelens-rollback/
+*.bak
+*.bak-*
+*.backup
+*.orig
+*.rej
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp

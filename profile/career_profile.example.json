@@ -1,0 +1,218 @@
+{
+  "schema_version": "3",
+  "profile_status": "example",
+  "purpose": "Full evidence base for the candidate. RoleLens does NOT send this file to a model; it exists so the compact matcher_profile can be derived from and checked against something concrete. THIS IS A SYNTHETIC EXAMPLE.",
+  "source_registry": {
+    "cv_primary": {
+      "kind": "cv",
+      "collected": "2026-01",
+      "note": "Synthetic example CV for a fictional candidate."
+    },
+    "portfolio": {
+      "kind": "portfolio",
+      "collected": "2026-01",
+      "note": "Fictional. Replace with your own sources."
+    }
+  },
+  "professional_identity": {
+    "evidence_based_summary": "AI/full-stack product engineer with four years of professional experience building and operating user-facing web products. Currently responsible for LLM-backed workflow features in a B2B SaaS product: prompt design, structured output validation, evaluation harnesses, cost control, and the surrounding API and UI work.",
+    "important_pattern": "Consistently owns a feature from user conversation through production and iteration, rather than implementing a specification written by someone else. Chooses simple, operable designs over infrastructure that needs a platform team.",
+    "do_not_reduce_to": [
+      "Front-end developer",
+      "Prompt engineer",
+      "Data scientist",
+      "DevOps engineer",
+      "Junior developer",
+      "Generic backend developer"
+    ],
+    "evidence": [
+      "Designed and shipped a document-triage feature backed by an LLM, including a JSON-schema output contract and a replayable evaluation set.",
+      "Owned the PostgreSQL schema and FastAPI service behind a customer-facing workflow product.",
+      "Ran discovery interviews with operations staff and converted the findings into a scoped roadmap.",
+      "Reduced LLM spend on a production feature by batching requests and caching normalized inputs."
+    ]
+  },
+  "career_trajectory": [
+    {
+      "period": "2022-2023",
+      "role": "Software Engineer",
+      "organization": "Fjord Analytics AB (fictional)",
+      "summary": "Full-stack feature work on an internal analytics product: React front end, Python API, PostgreSQL."
+    },
+    {
+      "period": "2023-2024",
+      "role": "Product Engineer",
+      "organization": "Nordwave Systems AB (fictional)",
+      "summary": "Owned two customer-facing modules end to end, including deployment and on-call for those modules."
+    },
+    {
+      "period": "2024-present",
+      "role": "Product Engineer, Applied AI",
+      "organization": "Nordwave Systems AB (fictional)",
+      "summary": "Leads the applied-AI surface of the product: LLM features, evaluation, structured output, cost and reliability."
+    }
+  ],
+  "capabilities": [
+    "End-to-end product feature delivery",
+    "Python API design and implementation",
+    "TypeScript/React interface work",
+    "Relational data modelling",
+    "LLM application engineering and evaluation",
+    "Third-party API integration",
+    "Automated testing and CI",
+    "Cloud deployment of small services",
+    "Customer discovery and technical communication",
+    "Production debugging across the stack"
+  ],
+  "technical_toolkit": {
+    "programming": ["Python", "TypeScript", "JavaScript", "SQL", "Bash", "HTML/CSS"],
+    "frontend": ["React", "Next.js", "Vite", "Tailwind CSS", "Playwright"],
+    "backend": ["FastAPI", "SQLAlchemy", "REST", "OpenAPI", "Celery"],
+    "data": ["PostgreSQL", "SQLite", "Redis", "pandas", "dbt (basic)", "Parquet"],
+    "ai": [
+      "LLM APIs",
+      "structured output / JSON Schema",
+      "prompt evaluation harnesses",
+      "retrieval over document sets",
+      "embeddings",
+      "token and cost budgeting",
+      "output validation",
+      "offline replay evaluation",
+      "guardrail policy layers"
+    ],
+    "infra": [
+      "Docker",
+      "GitHub Actions",
+      "Linux",
+      "Nginx",
+      "AWS App Runner",
+      "AWS S3",
+      "AWS RDS",
+      "Terraform (basic)",
+      "Sentry",
+      "cron",
+      "systemd"
+    ],
+    "security_governance": [
+      "OWASP basics",
+      "secret handling",
+      "least-privilege IAM",
+      "dependency scanning",
+      "PII minimisation",
+      "audit logging"
+    ],
+    "web_legacy_secondary": ["WordPress", "PHP", "jQuery", "shared hosting"]
+  },
+  "experience_evidence": [
+    {
+      "claim": "Production LLM feature ownership",
+      "evidence": "Document-triage feature: schema-constrained output, replayable evaluation set, batch request handling, monitored failure archive.",
+      "strength": "strong"
+    },
+    {
+      "claim": "Full-stack delivery",
+      "evidence": "Two customer-facing modules owned from schema to UI to deployment.",
+      "strength": "strong"
+    },
+    {
+      "claim": "Customer-facing technical work",
+      "evidence": "Ran discovery sessions with operations staff at three customers, in English.",
+      "strength": "moderate"
+    },
+    {
+      "claim": "Cloud operations",
+      "evidence": "Owns deployment and alerting for the modules built; not a platform or SRE role.",
+      "strength": "moderate"
+    },
+    {
+      "claim": "Data engineering",
+      "evidence": "Scheduled batch jobs and reporting tables; no large-scale streaming experience.",
+      "strength": "limited"
+    },
+    {
+      "claim": "Machine learning research",
+      "evidence": "University coursework only. Applies models, does not train them.",
+      "strength": "limited"
+    },
+    {
+      "claim": "Kubernetes / SRE specialization",
+      "evidence": "None beyond reading manifests written by others.",
+      "strength": "none"
+    }
+  ],
+  "education": [
+    {
+      "qualification": "BSc Computer Science",
+      "institution": "A Swedish university (fictional)",
+      "completed": "2022",
+      "note": "Algorithms, databases, distributed systems, introductory machine learning."
+    },
+    {
+      "qualification": "Swedish as a foreign language, A2",
+      "institution": "Municipal adult education (fictional)",
+      "completed": "in progress",
+      "note": "Reads Swedish job advertisements; not professionally fluent."
+    },
+    {
+      "qualification": "Cloud practitioner certification",
+      "institution": "Vendor certification (fictional)",
+      "completed": "2024",
+      "note": "Foundational, not an architecture credential."
+    }
+  ],
+  "role_hypotheses": [
+    "AI Product Engineer",
+    "Product Engineer",
+    "Full-Stack Engineer (product team)",
+    "Applied AI Engineer",
+    "Solutions / Implementation Engineer",
+    "Forward-Deployed Engineer",
+    "Technical Consultant with build responsibility"
+  ],
+  "known_gaps_or_caution_areas": [
+    "No professional Kubernetes, SRE or platform-engineering depth.",
+    "No ML training/research track record.",
+    "Swedish is A2; roles requiring professional Swedish are a genuine blocker.",
+    "Four years of experience; principal/staff requirements are not met."
+  ],
+  "job_search_constraints": {
+    "country": "Sweden",
+    "geography": {
+      "preferred": ["Stockholm"],
+      "acceptable": ["Göteborg", "Malmö"],
+      "remote_only_elsewhere": true
+    },
+    "work_arrangement": {
+      "preferred": "hybrid",
+      "acceptable": ["remote", "on-site in Stockholm"],
+      "note": "Relocation is not planned."
+    },
+    "employment_types": {
+      "preferred": ["permanent"],
+      "acceptable": ["long consulting engagement"],
+      "note": "Short contracts are deprioritised, not rejected."
+    },
+    "language": {
+      "working_language": "English",
+      "swedish": "A2, progressing",
+      "note": "An advertisement written in Swedish is not itself a Swedish requirement."
+    },
+    "eligibility": {
+      "right_to_work": "yes",
+      "citizenship": "unknown - must never be assumed by the evaluator",
+      "security_clearance": "unknown - must never be assumed by the evaluator",
+      "note": "Ordinary background screening is not the same as a clearance or citizenship requirement."
+    }
+  },
+  "matching_principles": [
+    "Infer the actual day-to-day work before scoring anything.",
+    "Ignore the advertised title until the work is understood.",
+    "career_fit measures the work; opportunity_score measures this vacancy.",
+    "Unknown is a state of its own; it is never evidence of failure.",
+    "Explicit mandatory language requirements are hard blockers.",
+    "A Swedish-language advertisement is not a Swedish-language requirement.",
+    "Background screening does not imply citizenship or clearance eligibility.",
+    "Seniority claims must rest on evidence, not on titles.",
+    "Prefer a false positive that costs a click over a false negative that hides a good role."
+  ]
+}

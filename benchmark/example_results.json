@@ -1,0 +1,278 @@
+{
+  "_note": "ILLUSTRATIVE ONLY. These evaluations were written by hand to show the output shape and to exercise the deterministic policy layer, then processed by the real normalize_evaluation_policy and classify_decision from rolelens.py. No provider was called. These are not benchmark results; see docs/provider-benchmark.md for those.",
+  "_how_to_read": "reported_decision is what the model said. deterministic_decision is what RoleLens actually does after the policy layer. Where they differ, the policy layer changed the outcome - that is the behaviour this benchmark exists to measure.",
+  "report": {
+    "provider": "illustrative",
+    "model": "hand-written-example",
+    "cases_total": 10,
+    "cases_returned": 10,
+    "batches_structurally_valid": 2,
+    "batches_total": 2,
+    "missing_ids": [],
+    "unexpected_ids": [],
+    "duplicate_ids": [],
+    "false_negatives": 0,
+    "false_positives": 0,
+    "weighted_error": 0,
+    "exact_decision_matches": 10,
+    "mean_career_fit_range_error": 0.0,
+    "mean_opportunity_range_error": 0.0,
+    "reported_decision_disagreements": 2,
+    "usage": {
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "reasoning_tokens": 0,
+      "total_tokens": 0
+    },
+    "mean_latency_seconds": null,
+    "cases": [
+      {
+        "case": "SC-AI-PRODUCT-01",
+        "status": "ok",
+        "label": "Excellent applied-AI product match, English-speaking team",
+        "expected_decision": "notify_strong",
+        "reported_decision": "notify_strong",
+        "deterministic_decision": "notify_strong",
+        "career_fit": 96,
+        "career_fit_range": [
+          90,
+          100
+        ],
+        "career_fit_range_error": 0,
+        "opportunity_score": 94,
+        "opportunity_score_range": [
+          85,
+          97
+        ],
+        "opportunity_range_error": 0,
+        "policy_changes": []
+      },
+      {
+        "case": "SC-SV-MANDATORY-01",
+        "status": "ok",
+        "label": "Great work fit, but fluent Swedish is explicitly mandatory",
+        "expected_decision": "store_no_notify",
+        "reported_decision": "notify_strong",
+        "deterministic_decision": "store_no_notify",
+        "career_fit": 94,
+        "career_fit_range": [
+          88,
+          100
+        ],
+        "career_fit_range_error": 0,
+        "opportunity_score": 49,
+        "opportunity_score_range": [
+          20,
+          49
+        ],
+        "opportunity_range_error": 0,
+        "policy_changes": [
+          "mandatory_swedish_enforced"
+        ]
+      },
+      {
+        "case": "SC-SV-PREFERRED-01",
+        "status": "ok",
+        "label": "Swedish is preferred but explicitly not required",
+        "expected_decision": "notify_good",
+        "reported_decision": "notify_good",
+        "deterministic_decision": "notify_good",
+        "career_fit": 90,
+        "career_fit_range": [
+          82,
+          95
+        ],
+        "career_fit_range_error": 0,
+        "opportunity_score": 84,
+        "opportunity_score_range": [
+          72,
+          90
+        ],
+        "opportunity_range_error": 0,
+        "policy_changes": [
+          "optional_swedish_not_blocking"
+        ]
+      },
+      {
+        "case": "SC-SV-AD-ONLY-01",
+        "status": "ok",
+        "label": "Advertisement written in Swedish, but the team works in English",
+        "expected_decision": "notify_strong",
+        "reported_decision": "notify_strong",
+        "deterministic_decision": "notify_strong",
+        "career_fit": 95,
+        "career_fit_range": [
+          88,
+          100
+        ],
+        "career_fit_range_error": 0,
+        "opportunity_score": 92,
+        "opportunity_score_range": [
+          82,
+          96
+        ],
+        "opportunity_range_error": 0,
+        "policy_changes": [
+          "optional_swedish_not_blocking"
+        ]
+      },
+      {
+        "case": "SC-SEC-SCREEN-01",
+        "status": "ok",
+        "label": "Ordinary background screening only, no citizenship or clearance",
+        "expected_decision": "notify_good",
+        "reported_decision": "notify_good",
+        "deterministic_decision": "notify_good",
+        "career_fit": 90,
+        "career_fit_range": [
+          85,
+          96
+        ],
+        "career_fit_range_error": 0,
+        "opportunity_score": 78,
+        "opportunity_score_range": [
+          70,
+          86
+        ],
+        "opportunity_range_error": 0,
+        "policy_changes": [
+          "screening_not_converted_to_eligibility"
+        ]
+      },
+      {
+        "case": "SC-CITIZEN-REQ-01",
+        "status": "ok",
+        "label": "Explicit citizenship requirement, candidate status genuinely unknown",
+        "expected_decision": "notify_verify",
+        "reported_decision": "notify_stretch",
+        "deterministic_decision": "notify_verify",
+        "career_fit": 91,
+        "career_fit_range": [
+          86,
+          96
+        ],
+        "career_fit_range_error": 0,
+        "opportunity_score": 62,
+        "opportunity_score_range": [
+          55,
+          69
+        ],
+        "opportunity_range_error": 0,
+        "policy_changes": [
+          "explicit_eligibility_preserved_unknown"
+        ]
+      },
+      {
+        "case": "SC-DEVOPS-ADJACENT-01",
+        "status": "ok",
+        "label": "Adjacent DevOps/platform role, transferable but not the candidate's depth",
+        "expected_decision": "store_no_notify",
+        "reported_decision": "store_no_notify",
+        "deterministic_decision": "store_no_notify",
+        "career_fit": 58,
+        "career_fit_range": [
+          45,
+          68
+        ],
+        "career_fit_range_error": 0,
+        "opportunity_score": 52,
+        "opportunity_score_range": [
+          35,
+          62
+        ],
+        "opportunity_range_error": 0,
+        "policy_changes": []
+      },
+      {
+        "case": "SC-STACK-SPECIALIST-01",
+        "status": "ok",
+        "label": "Specialist stack mismatch, superficially similar title",
+        "expected_decision": "store_no_notify",
+        "reported_decision": "store_no_notify",
+        "deterministic_decision": "store_no_notify",
+        "career_fit": 52,
+        "career_fit_range": [
+          40,
+          65
+        ],
+        "career_fit_range_error": 0,
+        "opportunity_score": 44,
+        "opportunity_score_range": [
+          30,
+          55
+        ],
+        "opportunity_range_error": 0,
+        "policy_changes": []
+      },
+      {
+        "case": "SC-SENIORITY-MISMATCH-01",
+        "status": "ok",
+        "label": "Principal-level requirement well above the candidate's evidence",
+        "expected_decision": "store_no_notify",
+        "reported_decision": "store_no_notify",
+        "deterministic_decision": "store_no_notify",
+        "career_fit": 30,
+        "career_fit_range": [
+          20,
+          45
+        ],
+        "career_fit_range_error": 0,
+        "opportunity_score": 18,
+        "opportunity_score_range": [
+          8,
+          30
+        ],
+        "opportunity_range_error": 0,
+        "policy_changes": [
+          "unknown_tenure_preserved"
+        ]
+      },
+      {
+        "case": "SC-UNRELATED-01",
+        "status": "ok",
+        "label": "Obvious reject, unrelated profession",
+        "expected_decision": "store_no_notify",
+        "reported_decision": "store_no_notify",
+        "deterministic_decision": "store_no_notify",
+        "career_fit": 5,
+        "career_fit_range": [
+          0,
+          15
+        ],
+        "career_fit_range_error": 0,
+        "opportunity_score": 3,
+        "opportunity_score_range": [
+          0,
+          12
+        ],
+        "opportunity_range_error": 0,
+        "policy_changes": [
+          "mandatory_swedish_enforced"
+        ]
+      }
+    ]
+  },
+  "policy_changes_by_case": {
+    "SC-SV-MANDATORY-01": [
+      "mandatory_swedish_enforced"
+    ],
+    "SC-SV-PREFERRED-01": [
+      "optional_swedish_not_blocking"
+    ],
+    "SC-SV-AD-ONLY-01": [
+      "optional_swedish_not_blocking"
+    ],
+    "SC-SEC-SCREEN-01": [
+      "screening_not_converted_to_eligibility"
+    ],
+    "SC-CITIZEN-REQ-01": [
+      "explicit_eligibility_preserved_unknown"
+    ],
+    "SC-SENIORITY-MISMATCH-01": [
+      "unknown_tenure_preserved"
+    ],
+    "SC-UNRELATED-01": [
+      "mandatory_swedish_enforced"
+    ]
+  }
+}

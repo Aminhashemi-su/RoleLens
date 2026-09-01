@@ -1,0 +1,262 @@
+{
+  "schema_version": 1,
+  "name": "RoleLens public sample benchmark",
+  "description": "Ten synthetic vacancies covering the error classes RoleLens actually cares about. Every company, URL and description is fictional and written for this repository. No real job advertisement is redistributed here.",
+  "candidate": "profile/matcher_profile.example.json",
+  "rules": "profile/matcher_rules_v1_1.json",
+  "expected_labels_note": "Expected ranges are deliberately wide. They express what a reasonable evaluator should conclude, not a single correct number. The decision column is what RoleLens's deterministic policy layer should produce, which is not always what the model reports.",
+  "batches": [
+    ["SC-AI-PRODUCT-01", "SC-SV-MANDATORY-01", "SC-SV-PREFERRED-01", "SC-SV-AD-ONLY-01", "SC-SEC-SCREEN-01"],
+    ["SC-CITIZEN-REQ-01", "SC-DEVOPS-ADJACENT-01", "SC-STACK-SPECIALIST-01", "SC-SENIORITY-MISMATCH-01", "SC-UNRELATED-01"]
+  ],
+  "cases": [
+    {
+      "source_job_id": "SC-AI-PRODUCT-01",
+      "label": "Excellent applied-AI product match, English-speaking team",
+      "tags": ["strong_match", "english_only", "ai_product"],
+      "job": {
+        "source_job_id": "SC-AI-PRODUCT-01",
+        "title": "Applied AI Product Engineer",
+        "company": "Nordwave Systems AB",
+        "location": "Stockholm, Stockholms län",
+        "remote_or_hybrid_indicated": true,
+        "fully_remote_indicated": false,
+        "application_deadline": "2026-12-31",
+        "employment_type": "Permanent",
+        "scope": "Full-time",
+        "url": "https://jobs.example/SC-AI-PRODUCT-01",
+        "description": "We are a small product team building an LLM-backed workflow tool for operations teams. You will own applied-AI features end to end: talk to users about the work they are trying to get done, design the prompt and the structured-output contract, build the Python API behind it, ship the React interface, and then measure and improve what you shipped. Our stack is Python and FastAPI, TypeScript and React, PostgreSQL, and containers on a managed cloud platform. We want someone who has taken an LLM feature past the demo stage and dealt with the unglamorous parts: schema validation, evaluation sets, retries, cost. Roughly three to six years of professional software experience. The team works in English and we are hybrid in Stockholm, two days a week in the office."
+      },
+      "expected": {
+        "career_fit_range": [90, 100],
+        "opportunity_score_range": [85, 97],
+        "expected_decision": "notify_strong",
+        "critical_checks": []
+      }
+    },
+    {
+      "source_job_id": "SC-SV-MANDATORY-01",
+      "label": "Great work fit, but fluent Swedish is explicitly mandatory",
+      "tags": ["mandatory_swedish", "high_fit_practical_blocker"],
+      "job": {
+        "source_job_id": "SC-SV-MANDATORY-01",
+        "title": "Produktutvecklare, AI-stödda arbetsflöden",
+        "company": "Lindgren Digital AB",
+        "location": "Stockholm, Stockholms län",
+        "remote_or_hybrid_indicated": true,
+        "fully_remote_indicated": false,
+        "application_deadline": "2026-12-31",
+        "employment_type": "Permanent",
+        "scope": "Full-time",
+        "url": "https://jobs.example/SC-SV-MANDATORY-01",
+        "description": "You will build an AI-assisted B2B workflow product from discovery through production. The work spans TypeScript, React, Python APIs and PostgreSQL. You will speak directly with our customers, turn ambiguous operational needs into product decisions, and own deployment and iteration. Production experience with modern web applications and professional English are required. Fluent Swedish is also required, because you will independently run weekly discovery and training sessions with Swedish-speaking customers and write documentation in Swedish. Svenska i tal och skrift är ett krav. The team works hybrid in Stockholm."
+      },
+      "expected": {
+        "career_fit_range": [88, 100],
+        "opportunity_score_range": [20, 49],
+        "expected_decision": "store_no_notify",
+        "critical_checks": ["B", "E"]
+      }
+    },
+    {
+      "source_job_id": "SC-SV-PREFERRED-01",
+      "label": "Swedish is preferred but explicitly not required",
+      "tags": ["optional_swedish", "should_not_block"],
+      "job": {
+        "source_job_id": "SC-SV-PREFERRED-01",
+        "title": "Product Solutions Engineer",
+        "company": "Klarvik Software AB",
+        "location": "Göteborg, Västra Götalands län",
+        "remote_or_hybrid_indicated": true,
+        "fully_remote_indicated": false,
+        "application_deadline": "2026-12-31",
+        "employment_type": "Permanent",
+        "scope": "Full-time",
+        "url": "https://jobs.example/SC-SV-PREFERRED-01",
+        "description": "Join the team that gets our platform live inside customer organisations. You will scope integrations, write the Python and TypeScript glue that connects our APIs to customer systems, and stay close to the customer until the rollout is genuinely working. We expect solid experience with REST APIs, relational databases and at least one modern front-end framework. Swedish is a merit and will help you in customer meetings, but it is not a requirement — our working language is English and several of our engineers do not speak Swedish. Hybrid in Göteborg."
+      },
+      "expected": {
+        "career_fit_range": [82, 95],
+        "opportunity_score_range": [72, 90],
+        "expected_decision": "notify_good",
+        "critical_checks": ["C"]
+      }
+    },
+    {
+      "source_job_id": "SC-SV-AD-ONLY-01",
+      "label": "Advertisement written in Swedish, but the team works in English",
+      "tags": ["swedish_ad_only", "should_not_block"],
+      "job": {
+        "source_job_id": "SC-SV-AD-ONLY-01",
+        "title": "Fullstackutvecklare för AI-produkt",
+        "company": "Almhult Produktstudio AB",
+        "location": "Stockholm, Stockholms län",
+        "remote_or_hybrid_indicated": true,
+        "fully_remote_indicated": false,
+        "application_deadline": "2026-12-31",
+        "employment_type": "Permanent",
+        "scope": "Full-time",
+        "url": "https://jobs.example/SC-SV-AD-ONLY-01",
+        "description": "Vi bygger en AI-baserad produkt som automatiserar komplexa arbetsflöden. Du arbetar från behovsanalys och prototyp till produktion, uppföljning och förbättring. Teknikerna omfattar React, TypeScript, Node.js, Python, PostgreSQL och molndrift. Rollen kräver dokumenterad erfarenhet av att leverera fullstackprodukter, samarbeta med verksamheten och göra avvägningar mellan kvalitet, kostnad och hastighet. Teamets arbetsspråk är engelska och ansökan ska lämnas på engelska. Kunskaper i svenska krävs inte. Vi arbetar hybrid i Stockholm."
+      },
+      "expected": {
+        "career_fit_range": [88, 100],
+        "opportunity_score_range": [82, 96],
+        "expected_decision": "notify_strong",
+        "critical_checks": ["C"]
+      }
+    },
+    {
+      "source_job_id": "SC-SEC-SCREEN-01",
+      "label": "Ordinary background screening only, no citizenship or clearance",
+      "tags": ["screening_only", "must_not_become_eligibility_blocker"],
+      "job": {
+        "source_job_id": "SC-SEC-SCREEN-01",
+        "title": "Technical Implementation Engineer",
+        "company": "Ravenport Systems AB",
+        "location": "Solna, Stockholms län",
+        "remote_or_hybrid_indicated": true,
+        "fully_remote_indicated": false,
+        "application_deadline": "2026-12-31",
+        "employment_type": "Permanent",
+        "scope": "Full-time",
+        "url": "https://jobs.example/SC-SEC-SCREEN-01",
+        "description": "We deliver a document-processing platform to regulated customers. You will configure and extend customer deployments, build integrations in Python, and work with the customer's technical staff during rollout. Experience with APIs, cloud services and relational databases is expected. English is our working language. All candidates go through a standard background check before employment, in line with our customer agreements. There is no clearance or citizenship requirement for this role. Hybrid in Solna."
+      },
+      "expected": {
+        "career_fit_range": [85, 96],
+        "opportunity_score_range": [70, 86],
+        "expected_decision": "notify_good",
+        "critical_checks": ["A", "D"]
+      }
+    },
+    {
+      "source_job_id": "SC-CITIZEN-REQ-01",
+      "label": "Explicit citizenship requirement, candidate status genuinely unknown",
+      "tags": ["citizenship_required", "unknown_must_stay_unknown"],
+      "job": {
+        "source_job_id": "SC-CITIZEN-REQ-01",
+        "title": "AI Solutions Engineer, public sector",
+        "company": "Havsbris Teknik AB",
+        "location": "Stockholm, Stockholms län",
+        "remote_or_hybrid_indicated": false,
+        "fully_remote_indicated": false,
+        "application_deadline": "2026-12-31",
+        "employment_type": "Permanent",
+        "scope": "Full-time",
+        "url": "https://jobs.example/SC-CITIZEN-REQ-01",
+        "description": "You will design and build AI-assisted case-handling tools for public-sector customers. The work is hands-on: Python services, structured model output, a React administration interface, and close collaboration with the customer's subject-matter experts. We work in English inside the team. Because the assignment concerns protected activity, the role requires Swedish citizenship and the successful candidate must pass a security vetting process before starting. On-site in Stockholm."
+      },
+      "expected": {
+        "career_fit_range": [86, 96],
+        "opportunity_score_range": [55, 69],
+        "expected_decision": "notify_verify",
+        "critical_checks": ["A", "E"]
+      }
+    },
+    {
+      "source_job_id": "SC-DEVOPS-ADJACENT-01",
+      "label": "Adjacent DevOps/platform role, transferable but not the candidate's depth",
+      "tags": ["adjacent_role", "over_notification_risk"],
+      "job": {
+        "source_job_id": "SC-DEVOPS-ADJACENT-01",
+        "title": "DevOps Engineer, developer platform",
+        "company": "Stenvik Cloud AB",
+        "location": "Stockholm, Stockholms län",
+        "remote_or_hybrid_indicated": true,
+        "fully_remote_indicated": false,
+        "application_deadline": "2026-12-31",
+        "employment_type": "Permanent",
+        "scope": "Full-time",
+        "url": "https://jobs.example/SC-DEVOPS-ADJACENT-01",
+        "description": "Our platform team keeps roughly forty services running for product engineers. You will own CI/CD pipelines, container build tooling, infrastructure-as-code, and the developer experience around deploying to our clusters. Day to day this means Terraform, GitHub Actions, Docker, and a good deal of Kubernetes. You should be comfortable being paged, and comfortable saying no to a change that would hurt reliability. Some Python and Go for internal tooling. We expect three or more years working primarily on infrastructure rather than on product features. English is fine."
+      },
+      "expected": {
+        "career_fit_range": [45, 68],
+        "opportunity_score_range": [35, 62],
+        "expected_decision": "store_no_notify",
+        "critical_checks": ["F"]
+      }
+    },
+    {
+      "source_job_id": "SC-STACK-SPECIALIST-01",
+      "label": "Specialist stack mismatch, superficially similar title",
+      "tags": ["specialist_stack", "over_notification_risk"],
+      "job": {
+        "source_job_id": "SC-STACK-SPECIALIST-01",
+        "title": "Frontend Framework Engineer, design system core",
+        "company": "Bergsund Interfaces AB",
+        "location": "Stockholm, Stockholms län",
+        "remote_or_hybrid_indicated": true,
+        "fully_remote_indicated": false,
+        "application_deadline": "2026-12-31",
+        "employment_type": "Permanent",
+        "scope": "Full-time",
+        "url": "https://jobs.example/SC-STACK-SPECIALIST-01",
+        "description": "This is not a product role. You will work inside our internal rendering framework: the component compiler, the accessibility layer, the browser-compatibility test matrix, and the release tooling that publishes the design system to sixty downstream teams. We need deep, demonstrable expertise in browser rendering internals, custom build pipelines, and the maintenance of a public component API across breaking changes. Candidates should have several years of dedicated framework or tooling work; general application development with React is not sufficient preparation for this position. TypeScript throughout. English is our working language."
+      },
+      "expected": {
+        "career_fit_range": [40, 65],
+        "opportunity_score_range": [30, 55],
+        "expected_decision": "store_no_notify",
+        "critical_checks": ["F"]
+      }
+    },
+    {
+      "source_job_id": "SC-SENIORITY-MISMATCH-01",
+      "label": "Principal-level requirement well above the candidate's evidence",
+      "tags": ["seniority_mismatch", "unknown_tenure_discipline"],
+      "job": {
+        "source_job_id": "SC-SENIORITY-MISMATCH-01",
+        "title": "Principal Site Reliability Engineer",
+        "company": "Tornvik Infrastructure AB",
+        "location": "Stockholm, Stockholms län",
+        "remote_or_hybrid_indicated": true,
+        "fully_remote_indicated": false,
+        "application_deadline": "2026-12-31",
+        "employment_type": "Permanent",
+        "scope": "Full-time",
+        "url": "https://jobs.example/SC-SENIORITY-MISMATCH-01",
+        "description": "You will set the reliability direction for a multi-region platform serving several million daily requests. This is a principal role: you will define error budgets across six teams, lead incident response for the most severe outages, and mentor senior engineers. We require at least ten years of infrastructure engineering, of which several at principal or staff level, deep Kubernetes operations experience, and a track record of designing multi-region failover. Strong Linux internals knowledge is essential. English is our working language."
+      },
+      "expected": {
+        "career_fit_range": [20, 45],
+        "opportunity_score_range": [8, 30],
+        "expected_decision": "store_no_notify",
+        "critical_checks": ["A", "F"]
+      }
+    },
+    {
+      "source_job_id": "SC-UNRELATED-01",
+      "label": "Obvious reject, unrelated profession",
+      "tags": ["unrelated", "sanity_check"],
+      "job": {
+        "source_job_id": "SC-UNRELATED-01",
+        "title": "HR Business Partner, Nordics",
+        "company": "Ekhaga Group AB",
+        "location": "Stockholm, Stockholms län",
+        "remote_or_hybrid_indicated": true,
+        "fully_remote_indicated": false,
+        "application_deadline": "2026-12-31",
+        "employment_type": "Permanent",
+        "scope": "Full-time",
+        "url": "https://jobs.example/SC-UNRELATED-01",
+        "description": "You will partner with our Nordic leadership team on organisational design, performance cycles, compensation reviews, employee relations cases and collective bargaining matters. A degree in human resources or behavioural science and at least five years in an HR business partner role are required, along with practical knowledge of Swedish labour law and experience working with union representatives. Fluent Swedish and English are required. Hybrid in Stockholm."
+      },
+      "expected": {
+        "career_fit_range": [0, 15],
+        "opportunity_score_range": [0, 12],
+        "expected_decision": "store_no_notify",
+        "critical_checks": []
+      }
+    }
+  ],
+  "critical_checks": {
+    "A": "An unknown fact was converted into an unmet requirement.",
+    "B": "An explicit mandatory Swedish requirement was ignored.",
+    "C": "A Swedish-language advertisement, or optional Swedish, was treated as mandatory.",
+    "D": "Ordinary background screening was converted into a citizenship or clearance requirement.",
+    "E": "career_fit was reduced because of a practical blocker that belongs in opportunity_score.",
+    "F": "An obvious mandatory seniority or specialist-stack blocker was ignored."
+  }
+}
