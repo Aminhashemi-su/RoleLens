@@ -3,10 +3,95 @@
 RoleLens was developed under an earlier internal name before this repository
 existed, so V1.1–V1.4 have no individual Git commits. This file records the
 known major versions instead. Version 1.5.1 is the first state captured in
-Git; 1.5.3 is the current release.
+Git; 1.7.0 is the current release.
 
 The format is loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project does not follow strict semantic versioning.
+
+## [1.7.0] — 2026-09-01
+
+Observability for provider failures and for recovery runs.
+
+### Fixed
+- **The transport fallback now records *which* failure triggered it.** The
+  warning was the same regardless of cause, and the underlying error was logged
+  only when *both* providers failed, so a rate limit, a 503 and a socket
+  timeout were indistinguishable afterwards. `TemporaryProviderError` now
+  carries the HTTP status, the warning includes it, and a `Retry-After` header
+  is surfaced when the provider sends one.
+- **`backfill` now writes a `runs` row.** A recovery run consumed provider
+  tokens without being recorded, so token and cost accounting for it was
+  missing and the run counter never moved. It is recorded like any other run,
+  with a `status` of success/partial/error, and its summary line reports tokens
+  and fallbacks.
+
+### Added
+- `TemporaryProviderError.reason`, a short bounded label such as `http_429` or
+  `transport_TimeoutError`, deliberately capped so an arbitrary provider message
+  can never become a dictionary key in a stored run record.
+- `RunStats.fallback_reasons`, counting those labels, and `RunStats.mode`
+  (`live` or `backfill`) so the two kinds of run are distinguishable in
+  `stats_json`.
+- `evaluate_with_fallback(..., stats=...)`, optional so existing callers are
+  unaffected.
+- 14 new tests (133 → 147): status capture through the HTTP path, permanent
+  statuses staying non-temporary, reason counting, double-failure recording,
+  bounded keys, and backfill run accounting for success, partial, dry-run and
+  empty-backlog cases.
+
+### Notes
+- A `backfill --dry-run`, and a run with nothing left to evaluate, still record
+  nothing. Only a run that actually consumes provider tokens is written.
+
+## [1.6.0] — 2026-09-01
+
+Historical recovery mode. The live pipeline, the live selector and scheduled
+behaviour are unchanged.
+
+Activating live mode freezes already-discovered but unevaluated jobs behind the
+live cutoff: they are never assessed, and under live-mode selection never would
+be. This release adds an isolated recovery path for them rather than weakening
+or reusing live-mode behaviour.
+
+### Added
+- **`backfill`** — evaluates open historical jobs the live selector skips.
+  Selects only jobs that are unevaluated for the current `profile_version`,
+  historical relative to `live_since`, still open today in the market timezone,
+  and pass the deterministic prefilter. Ordered by urgency: deadline ASC,
+  discovery score DESC, published/first-seen DESC. Same evaluator, same policy
+  layer, same batch size of 10, same primary/transport-fallback routing, same
+  missing-ID semantics and one bounded cleanup pass, same
+  `max_candidates_per_run` ceiling, same run lock.
+  **It never writes notification state**, so a recovery run cannot consume a
+  match that has not been delivered. `--dry-run` shows the selection, the
+  urgency tail and cost estimates without a provider call or a write.
+- **`backfill-status`** — a read-only, free breakdown of the historical
+  backlog: unevaluated, still open, expired, closing today/tomorrow/3 days/7
+  days, evaluated, and matches awaiting delivery.
+- **`backfill-report`** — the delivery phase. Emits one bounded page of stored
+  historical matches and marks **only the entries it actually printed**, so a
+  truncated page is retried rather than silently lost. Repeat until it reports
+  completion.
+- `market_today()` and `MARKET_TIMEZONE`. Platsbanken deadlines are Swedish
+  calendar dates, so comparing them against the UTC date keeps a vacancy that
+  closed at midnight alive for the last hours of the UTC day. Falls back to UTC
+  where no tz database exists, which is lenient rather than strict.
+- `prefilter_reason()`, one deterministic exclusion predicate now shared by
+  discovery and recovery. `should_prefilter` delegates to it; behaviour is
+  identical.
+- 24 new tests (109 → 133).
+
+### Changed
+- `Database.unnotified()` takes `historical=`, so live delivery and historical
+  delivery draw from disjoint sets. The live selector never evaluates a
+  historical job, so the live queue could only ever contain live rows; this
+  matters the moment a recovery run starts producing historical evaluations,
+  which must not leak into the daily alert and drown genuinely new vacancies.
+
+### Notes
+- `live_since` is never modified. Recovery reads around it; it does not move it.
+- Expired historical jobs are never selected, so they are never paid for.
+- Historical jobs are kept after recovery. They are useful evidence.
 
 ## [1.5.3] — 2026-09-01
 

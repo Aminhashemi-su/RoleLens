@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime as dt
 import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -1522,6 +1524,592 @@ class DoctorOnboardingTests(unittest.TestCase):
             info = cs.doctor(settings, require_key=True)
             self.assertEqual(info["candidate_swedish_level"], "unknown")
             self.assertTrue(any("constraints.swedish" in step for step in info["next_steps"]))
+
+class _BackfillHarness(_PipelineHarness):
+    """A home whose database already carries a frozen historical backlog."""
+
+    CUTOFF = "2026-08-29T19:08:23.284604+00:00"
+    TODAY = dt.date(2026, 9, 1)
+    TEXT = "Build AI products end to end with Python, TypeScript and PostgreSQL."
+
+    def seed_history(self, settings, rows):
+        """rows: (source_id, title, deadline, discovery_score, historical)."""
+        db = cs.Database(settings.db_path)
+        try:
+            for source_id, title, deadline, score, historical in rows:
+                job = cs.normalize_job(
+                    self.raw_job(source_id, title, "Acme AB", "Stockholm", self.TEXT))
+                job.application_deadline = deadline
+                job.discovery_score = score
+                db.upsert_job(job)
+                stamp = "2026-08-20T09:00:00+00:00" if historical else "2026-08-31T09:00:00+00:00"
+                db.conn.execute(
+                    "UPDATE jobs SET content_changed_at=?, first_seen_at=? WHERE source_job_id=?",
+                    (stamp, stamp, str(source_id)))
+            db.conn.commit()
+            db.set_meta("live_since", self.CUTOFF)
+        finally:
+            db.close()
+
+    def version_of(self, settings):
+        return cs.load_profile_bundle(settings)[2]
+
+    def select(self, settings, limit=300, today=None):
+        db = cs.Database(settings.db_path)
+        try:
+            scoped = dataclasses.replace(settings, max_candidates_per_run=limit)
+            kept, excluded = cs.select_historical_candidates(
+                db, scoped, self.version_of(settings), today=today or self.TODAY)
+            return [r["source_job_id"] for r in kept], excluded
+        finally:
+            db.close()
+
+    def counts(self, settings, today=None):
+        db = cs.Database(settings.db_path)
+        try:
+            return db.historical_counts(self.version_of(settings), today=today or self.TODAY)
+        finally:
+            db.close()
+
+    def scalar(self, settings, sql):
+        db = cs.Database(settings.db_path)
+        try:
+            return int(db.conn.execute(sql).fetchone()[0])
+        finally:
+            db.close()
+
+    @contextlib.contextmanager
+    def provider(self, scores, omit=(), action=None):
+        """Patch ProviderMatcher exactly as the live-pipeline harness does."""
+        test = self
+        calls: list[tuple[str, tuple[str, ...]]] = []
+
+        class Stub:
+            def __init__(self, settings_, secrets, profile, rules, provider):
+                self.provider = provider
+                self.model = ("gemini-3.7-flash" if provider == cs.PRIMARY_PROVIDER
+                              else "gpt-5-mini")
+
+            def evaluate(self, jobs):
+                ids = [str(r["source_job_id"]) for r in jobs]
+                index = len(calls)
+                calls.append((self.provider, tuple(ids)))
+                if action is not None:
+                    verdict = action(index, ids, self.provider)
+                    if verdict == "raise":
+                        raise cs.TemporaryProviderError(self.provider, "503 upstream unavailable")
+                    if verdict == "output":
+                        return cs.ProviderBatchResult(
+                            self.provider, self.model, (), frozenset(ids),
+                            cs.empty_usage(), "invalid JSON: boom", "output")
+                keep = [i for i in ids if i not in set(omit)]
+                evals = tuple(test.evaluation(i, scores.get(i, 30)) for i in keep)
+                missing = frozenset(set(ids) - set(keep))
+                return cs.ProviderBatchResult(
+                    self.provider, self.model, evals, missing, cs.empty_usage(),
+                    ("missing/invalid IDs: " + ", ".join(sorted(missing))) if missing else None,
+                    "completeness" if missing else None)
+
+        original = cs.ProviderMatcher
+        cs.ProviderMatcher = Stub
+        try:
+            yield calls
+        finally:
+            cs.ProviderMatcher = original
+
+    def backfill(self, settings, scores, omit=(), action=None, **kwargs):
+        out = io.StringIO()
+        with self.provider(scores, omit=omit, action=action) as calls:
+            with contextlib.redirect_stdout(out):
+                cs.run_backfill(settings, dry_run=False, **kwargs)
+        return out.getvalue(), calls
+
+    def report(self, settings, **kwargs):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cs.run_backfill_report(settings, **kwargs)
+        return out.getvalue()
+
+    def store_matches(self, settings, count, score=95):
+        self.seed_history(settings, [
+            (f"m{i:02d}", f"Match {i}", "2026-09-10T23:59:59", count - i, True)
+            for i in range(count)])
+        self.backfill(settings, {f"m{i:02d}": score for i in range(count)})
+
+
+class HistoricalSelectorTests(_BackfillHarness):
+    def test_expired_historical_jobs_are_never_selected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                ("h-open", "Open", "2026-09-10T23:59:59", 10, True),
+                ("h-gone", "Closed yesterday", "2026-08-31T23:59:59", 99, True),
+                ("h-edge", "Closes today", "2026-09-01T23:59:59", 50, True)])
+            ids, excluded = self.select(s)
+            self.assertNotIn("h-gone", ids)
+            self.assertIn("h-edge", ids, "a vacancy closing today is still open")
+            self.assertIn("h-open", ids)
+            self.assertEqual(excluded, {})
+
+    def test_ordering_is_by_urgency_then_score(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                ("later", "Later", "2026-09-20T23:59:59", 99, True),
+                ("today-a", "Today low", "2026-09-01T23:59:59", 5, True),
+                ("today-b", "Today high", "2026-09-01T23:59:59", 40, True),
+                ("tomorrow", "Tomorrow", "2026-09-02T23:59:59", 99, True),
+                ("undated", "No deadline", None, 99, True)])
+            ids, _ = self.select(s)
+            self.assertEqual(ids[:4], ["today-b", "today-a", "tomorrow", "later"])
+            self.assertEqual(ids[-1], "undated", "undated cannot expire, so it sorts last")
+
+    def test_live_jobs_are_never_selected_for_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                ("historical", "Historical", "2026-09-10T23:59:59", 10, True),
+                ("live", "Live", "2026-09-10T23:59:59", 99, False)])
+            self.assertEqual(self.select(s)[0], ["historical"])
+
+    def test_already_evaluated_historical_jobs_are_excluded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                ("one", "One", "2026-09-10T23:59:59", 10, True),
+                ("two", "Two", "2026-09-10T23:59:59", 10, True)])
+            db = cs.Database(s.db_path)
+            try:
+                row = db.conn.execute("SELECT * FROM jobs WHERE source_job_id='one'").fetchone()
+                db.save_evaluation(row, self.evaluation("one", 90),
+                                   profile_version=self.version_of(s), model="test:model")
+            finally:
+                db.close()
+            self.assertEqual(self.select(s)[0], ["two"])
+
+    def test_the_candidate_ceiling_bounds_the_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                (f"h{i:03d}", f"Job {i}", "2026-09-10T23:59:59", i, True) for i in range(40)])
+            self.assertEqual(len(self.select(s, limit=25)[0]), 25)
+
+    def test_bootstrap_database_yields_no_historical_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [("h", "H", "2026-09-10T23:59:59", 5, True)])
+            db = cs.Database(s.db_path)
+            try:
+                db.conn.execute("DELETE FROM meta WHERE key='live_since'")
+                db.conn.commit()
+                self.assertEqual(
+                    db.historical_pending(self.version_of(s), 300, today=self.TODAY), [])
+            finally:
+                db.close()
+
+    def test_market_date_drives_expiry_not_the_utc_date(self):
+        # 22:30 UTC on 1 Sep is already 2 Sep in Stockholm, so a vacancy whose
+        # deadline was 1 Sep is closed even though the UTC date still reads 1 Sep.
+        moment = dt.datetime(2026, 9, 1, 22, 30, tzinfo=dt.timezone.utc)
+        self.assertEqual(moment.date(), dt.date(2026, 9, 1))
+        if cs._MARKET_TZ is None:
+            self.skipTest("no tz database on this platform")
+        self.assertEqual(cs.market_today(moment), dt.date(2026, 9, 2))
+        self.assertTrue(cs.application_expired("2026-09-01T23:59:59", cs.market_today(moment)))
+
+
+class BackfillEvaluationTests(_BackfillHarness):
+    def test_backfill_evaluates_and_stores_but_delivers_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                (f"h{i:02d}", f"Job {i}", "2026-09-10T23:59:59", i, True) for i in range(12)])
+            out, calls = self.backfill(s, {f"h{i:02d}": 95 for i in range(12)})
+            self.assertEqual(self.scalar(s, "SELECT COUNT(*) FROM evaluations"), 12)
+            self.assertEqual(self.scalar(s, "SELECT COUNT(*) FROM notifications"), 0,
+                             "backfill must never consume notification state")
+            self.assertEqual([len(ids) for _, ids in calls], [10, 2])
+            self.assertIn("12 evaluated", out)
+            self.assertIn("nothing was delivered", out)
+
+    def test_batches_stay_at_ten_and_use_gemini_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                (f"h{i:02d}", f"Job {i}", "2026-09-10T23:59:59", 50 - i, True) for i in range(25)])
+            _, calls = self.backfill(s, {f"h{i:02d}": 40 for i in range(25)})
+            self.assertEqual([len(ids) for _, ids in calls], [10, 10, 5])
+            self.assertEqual({p for p, _ in calls}, {cs.PRIMARY_PROVIDER})
+
+    def test_a_completeness_gap_continues_and_gets_one_cleanup_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                (f"h{i:02d}", f"Job {i}", "2026-09-10T23:59:59", 50 - i, True) for i in range(20)])
+            out, calls = self.backfill(s, {f"h{i:02d}": 40 for i in range(20)}, omit={"h00"})
+            self.assertEqual([len(ids) for _, ids in calls], [10, 10, 1],
+                             "both batches run, then one cleanup call")
+            self.assertEqual({p for p, _ in calls}, {cs.PRIMARY_PROVIDER},
+                             "a missing ID must never reach Azure")
+            self.assertEqual(self.scalar(s, "SELECT COUNT(*) FROM evaluations"), 19)
+            self.assertIn("1 unresolved", out)
+
+    def test_transport_failure_falls_back_to_azure_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                (f"h{i:02d}", f"Job {i}", "2026-09-10T23:59:59", i, True) for i in range(5)])
+            script = lambda i, ids, provider: "raise" if provider == cs.PRIMARY_PROVIDER else "ok"
+            _, calls = self.backfill(s, {f"h{i:02d}": 40 for i in range(5)}, action=script)
+            self.assertEqual([p for p, _ in calls], [cs.PRIMARY_PROVIDER, cs.FALLBACK_PROVIDER])
+
+    def test_an_unparseable_envelope_preserves_the_rest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                (f"h{i:02d}", f"Job {i}", "2026-09-10T23:59:59", 50 - i, True) for i in range(25)])
+            script = lambda i, ids, provider: "output" if i == 1 else None
+            out, _ = self.backfill(s, {f"h{i:02d}": 40 for i in range(25)}, action=script)
+            self.assertEqual(self.scalar(s, "SELECT COUNT(*) FROM evaluations"), 10)
+            self.assertIn("provider error", out)
+            self.assertEqual(self.counts(s)["historical_still_open_pending"], 15)
+
+    def test_repeated_runs_drain_the_backlog_deterministically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                (f"h{i:02d}", f"Job {i}", "2026-09-10T23:59:59", i, True) for i in range(25)])
+            scores = {f"h{i:02d}": 30 for i in range(25)}
+            for _ in range(3):
+                self.backfill(s, scores, limit=10)
+            self.assertEqual(self.scalar(s, "SELECT COUNT(*) FROM evaluations"), 25)
+            self.assertEqual(self.counts(s)["historical_still_open_pending"], 0)
+
+    def test_reposts_are_suppressed_before_they_cost_a_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                ("orig", "Member of Technical Staff", "2026-09-10T23:59:59", 20, True),
+                ("repost", "Member of Technical Staff", "2026-09-10T23:59:59", 20, True)])
+            _, calls = self.backfill(s, {"orig": 40, "repost": 40})
+            self.assertEqual(sum(len(ids) for _, ids in calls), 1, "the repost costs nothing")
+
+    def test_dry_run_makes_no_provider_call_and_no_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                ("h1", "One", "2026-09-02T23:59:59", 10, True),
+                ("h2", "Two", "2026-09-20T23:59:59", 10, True)])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                cs.run_backfill(s, dry_run=True)
+            text = out.getvalue()
+            self.assertIn("DRY RUN", text)
+            self.assertIn("selected this run", text)
+            self.assertEqual(self.scalar(s, "SELECT COUNT(*) FROM evaluations"), 0)
+
+    def test_live_pipeline_still_sees_nothing_historical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [("h1", "Historical", "2026-09-10T23:59:59", 99, True)])
+            db = cs.Database(s.db_path)
+            try:
+                version = self.version_of(s)
+                self.assertEqual(db.pending_count(version, respect_live_mode=True), 0)
+                self.assertEqual(db.pending_jobs(version, 300), [])
+            finally:
+                db.close()
+
+
+class BackfillDeliveryTests(_BackfillHarness):
+    def test_a_page_is_bounded_and_marks_only_what_it_emitted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.store_matches(s, 20)
+            text = self.report(s, limit=5)
+            self.assertEqual(text.count("Opportunity"), 5)
+            self.assertEqual(self.scalar(s, "SELECT COUNT(*) FROM notifications"), 5)
+            self.assertIn("still waiting", text)
+
+    def test_repeated_pages_deliver_every_match_exactly_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.store_matches(s, 18)
+            seen = []
+            for _ in range(8):
+                text = self.report(s, limit=5)
+                seen += re.findall(r"Match \d+", text)
+                if "all worthwhile open matches delivered" in text:
+                    break
+            self.assertEqual(len(seen), len(set(seen)), "no match delivered twice")
+            self.assertEqual(len(seen), 18, "every match delivered")
+
+    def test_the_final_page_reports_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.store_matches(s, 3)
+            self.report(s, limit=5)
+            self.assertIn("all worthwhile open matches delivered", self.report(s, limit=5))
+
+    def test_a_page_never_marks_more_delivered_than_it_emitted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.store_matches(s, 40)
+            text = self.report(s, limit=40)
+            emitted = text.count("Opportunity")
+            self.assertLess(emitted, 40, "the size guard must truncate the page")
+            self.assertEqual(self.scalar(s, "SELECT COUNT(*) FROM notifications"), emitted)
+
+    def test_historical_matches_never_leak_into_the_live_alert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.store_matches(s, 6)
+            db = cs.Database(s.db_path)
+            try:
+                self.assertEqual(db.unnotified(50), [], "live delivery must not see them")
+                self.assertEqual(len(db.unnotified(50, historical=True)), 6)
+            finally:
+                db.close()
+
+    def test_report_without_stored_matches_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [("h1", "One", "2026-09-10T23:59:59", 5, True)])
+            self.assertIn("all worthwhile open matches delivered", self.report(s))
+
+
+class BackfillStatusTests(_BackfillHarness):
+    def test_status_breaks_the_backlog_down_by_urgency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                ("today", "Today", "2026-09-01T23:59:59", 1, True),
+                ("tomorrow", "Tomorrow", "2026-09-02T23:59:59", 1, True),
+                ("in3", "Three days", "2026-09-04T23:59:59", 1, True),
+                ("in7", "Seven days", "2026-09-08T23:59:59", 1, True),
+                ("far", "Far", "2026-10-30T23:59:59", 1, True),
+                ("expired", "Expired", "2026-08-01T23:59:59", 1, True),
+                ("live", "Live", "2026-09-10T23:59:59", 1, False)])
+            c = self.counts(s)
+            self.assertEqual(c["historical_unevaluated"], 6, "the live job is not historical")
+            self.assertEqual(c["historical_expired_unevaluated"], 1)
+            self.assertEqual(c["historical_still_open_pending"], 5)
+            self.assertEqual(c["closing_today"], 1)
+            self.assertEqual(c["closing_tomorrow"], 1)
+            self.assertEqual(c["closing_within_3_days"], 3)
+            self.assertEqual(c["closing_within_7_days"], 4)
+            self.assertEqual(c["historical_matches_awaiting_delivery"], 0)
+
+    def test_counts_track_evaluation_and_delivery_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.store_matches(s, 4)
+            c = self.counts(s)
+            self.assertEqual(c["historical_evaluated"], 4)
+            self.assertEqual(c["historical_still_open_pending"], 0)
+            self.assertEqual(c["historical_matches_awaiting_delivery"], 4)
+            self.report(s, limit=2)
+            self.assertEqual(self.counts(s)["historical_matches_awaiting_delivery"], 2)
+
+class FallbackReasonTests(unittest.TestCase):
+    """A transport failure must record which failure it was."""
+
+    def test_http_status_becomes_a_countable_reason(self):
+        for code in (429, 503, 500, 408):
+            err = cs.TemporaryProviderError("vertex_gemini", f"boom {code}", status=code)
+            self.assertEqual(err.reason, f"http_{code}")
+
+    def test_a_transport_failure_is_labelled_by_its_exception(self):
+        err = cs.TemporaryProviderError(
+            "vertex_gemini", "vertex_gemini transport failure: TimeoutError")
+        self.assertEqual(err.reason, "transport_TimeoutError")
+
+    def test_reason_keys_stay_bounded(self):
+        """These become keys in the run record, so they cannot be free text."""
+        noisy = cs.TemporaryProviderError("p", "503 upstream unavailable, " + "x" * 500)
+        self.assertEqual(noisy.reason, "transport_unknown")
+        self.assertLessEqual(len(noisy.reason), 48)
+        for message in ("", "weird", "a: b: c"):
+            self.assertTrue(cs.TemporaryProviderError("p", message).reason.startswith("transport_"))
+
+    def test_the_status_survives_the_http_error_path(self):
+        import urllib.error
+
+        class Fake(urllib.error.HTTPError):
+            def __init__(self):
+                super().__init__("http://x", 429, "Too Many Requests",
+                                 {"Retry-After": "30"}, None)
+
+        def opener(request, timeout=None):
+            raise Fake()
+
+        original = cs.urllib.request.urlopen
+        cs.urllib.request.urlopen = opener
+        try:
+            with self.assertRaises(cs.TemporaryProviderError) as caught:
+                cs.provider_json_request(provider="vertex_gemini", url="http://x",
+                                         headers={}, payload={}, timeout=5)
+        finally:
+            cs.urllib.request.urlopen = original
+        self.assertEqual(caught.exception.status, 429)
+        self.assertEqual(caught.exception.reason, "http_429")
+        self.assertIn("Retry-After: 30", str(caught.exception),
+                      "a rate limit should say how long to wait")
+
+    def test_a_permanent_status_is_not_a_temporary_error(self):
+        import urllib.error
+
+        class Fake(urllib.error.HTTPError):
+            def __init__(self):
+                super().__init__("http://x", 401, "Unauthorized", {}, None)
+
+        original = cs.urllib.request.urlopen
+        cs.urllib.request.urlopen = lambda r, timeout=None: (_ for _ in ()).throw(Fake())
+        try:
+            with self.assertRaises(cs.RemoteAPIError) as caught:
+                cs.provider_json_request(provider="vertex_gemini", url="http://x",
+                                         headers={}, payload={}, timeout=5)
+            self.assertNotIsInstance(caught.exception, cs.TemporaryProviderError)
+        finally:
+            cs.urllib.request.urlopen = original
+
+    def test_the_reason_is_counted_into_run_stats(self):
+        class Primary:
+            provider = cs.PRIMARY_PROVIDER
+            model = "gemini-3.7-flash"
+
+            def evaluate(self, jobs):
+                raise cs.TemporaryProviderError(self.provider, "rate limited", status=429)
+
+        class Fallback:
+            provider = cs.FALLBACK_PROVIDER
+            model = "gpt-5-mini"
+
+            def evaluate(self, jobs):
+                return cs.ProviderBatchResult(self.provider, self.model, (), frozenset(),
+                                              cs.empty_usage())
+
+        stats = cs.RunStats()
+        cs.evaluate_with_fallback(Primary(), Fallback(), [], stats=stats)
+        self.assertEqual(stats.fallback_reasons, {"http_429": 1})
+        cs.evaluate_with_fallback(Primary(), Fallback(), [], stats=stats)
+        self.assertEqual(stats.fallback_reasons, {"http_429": 2})
+
+    def test_a_double_failure_records_both_and_names_the_cause(self):
+        class Down:
+            def __init__(self, provider, status):
+                self.provider = provider
+                self.model = "m"
+                self.status = status
+
+            def evaluate(self, jobs):
+                raise cs.TemporaryProviderError(self.provider, "down", status=self.status)
+
+        stats = cs.RunStats()
+        result, used = cs.evaluate_with_fallback(
+            Down(cs.PRIMARY_PROVIDER, 503), Down(cs.FALLBACK_PROVIDER, 429), [], stats=stats)
+        self.assertTrue(used)
+        self.assertEqual(result.error_kind, "transport")
+        self.assertIn("http_503", result.error)
+        self.assertIn("http_429", result.error)
+        self.assertEqual(stats.fallback_reasons,
+                         {"http_503": 1, "both_failed:http_503": 1})
+
+    def test_stats_is_optional_so_existing_callers_keep_working(self):
+        class Primary:
+            provider = cs.PRIMARY_PROVIDER
+            model = "m"
+
+            def evaluate(self, jobs):
+                raise cs.TemporaryProviderError(self.provider, "x", status=500)
+
+        class Fallback:
+            provider = cs.FALLBACK_PROVIDER
+            model = "m"
+
+            def evaluate(self, jobs):
+                return cs.ProviderBatchResult(self.provider, self.model, (), frozenset(),
+                                              cs.empty_usage())
+
+        result, used = cs.evaluate_with_fallback(Primary(), Fallback(), [])
+        self.assertTrue(used)
+
+
+class BackfillRunAccountingTests(_BackfillHarness):
+    """A backfill run is recorded like any other, so its cost is accounted for."""
+
+    def runs_rows(self, settings):
+        db = cs.Database(settings.db_path)
+        try:
+            return db.conn.execute(
+                "SELECT status, stats_json, error FROM runs ORDER BY id").fetchall()
+        finally:
+            db.close()
+
+    def test_a_backfill_run_writes_a_runs_row_tagged_as_backfill(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                (f"h{i:02d}", f"Job {i}", "2026-09-10T23:59:59", i, True) for i in range(12)])
+            self.assertEqual(len(self.runs_rows(s)), 0)
+            self.backfill(s, {f"h{i:02d}": 40 for i in range(12)})
+            rows = self.runs_rows(s)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["status"], "success")
+            stats = json.loads(rows[0]["stats_json"])
+            self.assertEqual(stats["mode"], "backfill")
+            self.assertEqual(stats["evaluated"], 12)
+            self.assertEqual(stats["snapshot_size"], 12)
+
+    def test_a_dry_run_records_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [("h1", "One", "2026-09-10T23:59:59", 5, True)])
+            with contextlib.redirect_stdout(io.StringIO()):
+                cs.run_backfill(s, dry_run=True)
+            self.assertEqual(len(self.runs_rows(s)), 0)
+
+    def test_an_empty_backlog_records_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [("gone", "Closed", "2026-08-01T23:59:59", 5, True)])
+            with contextlib.redirect_stdout(io.StringIO()):
+                cs.run_backfill(s, dry_run=False)
+            self.assertEqual(len(self.runs_rows(s)), 0,
+                             "a run that spends nothing should not be recorded")
+
+    def test_a_provider_failure_is_recorded_as_partial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                (f"h{i:02d}", f"Job {i}", "2026-09-10T23:59:59", 30 - i, True)
+                for i in range(25)])
+            script = lambda i, ids, provider: "output" if i == 1 else None
+            self.backfill(s, {f"h{i:02d}": 40 for i in range(25)}, action=script)
+            rows = self.runs_rows(s)
+            self.assertEqual(rows[0]["status"], "partial")
+            self.assertTrue(rows[0]["error"])
+
+    def test_the_run_row_carries_the_fallback_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed_history(s, [
+                (f"h{i:02d}", f"Job {i}", "2026-09-10T23:59:59", i, True) for i in range(5)])
+            script = lambda i, ids, provider: "raise" if provider == cs.PRIMARY_PROVIDER else None
+            self.backfill(s, {f"h{i:02d}": 40 for i in range(5)}, action=script)
+            stats = json.loads(self.runs_rows(s)[0]["stats_json"])
+            self.assertEqual(stats["fallback_calls"], 1)
+            self.assertTrue(stats["fallback_reasons"],
+                            "the reason must reach the run record")
+
+    def test_a_live_run_is_still_tagged_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self.build_home(tmp)
+            self.seed(s, self.distinct(3))
+            self.drive(s)
+            rows = self.runs_rows(s)
+            self.assertEqual(json.loads(rows[-1]["stats_json"])["mode"], "live")
+
 
 if __name__ == "__main__":
     unittest.main()

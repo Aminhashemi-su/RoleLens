@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 APP_NAME = "rolelens"
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.7.0"
 SCHEMA_VERSION = "2"
 DEFAULT_HOME = Path.home() / ".rolelens"
 JOBSEARCH_BASE_URL = "https://jobsearch.api.jobtechdev.se"
@@ -46,7 +46,31 @@ FALLBACK_PROVIDER = "azure_gpt5mini"
 RETRYABLE_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 UTC = dt.timezone.utc
 
+# Platsbanken deadlines are Swedish calendar dates. Comparing them against the
+# UTC date keeps a vacancy that closed at midnight alive for the last hour or
+# two of the UTC day, so date arithmetic uses the market's own timezone.
+MARKET_TIMEZONE = "Europe/Stockholm"
+try:  # pragma: no cover - platform dependent
+    from zoneinfo import ZoneInfo
+
+    _MARKET_TZ: Any = ZoneInfo(MARKET_TIMEZONE)
+except Exception:  # pragma: no cover - no tz database on this platform
+    _MARKET_TZ = None
+
 LOG = logging.getLogger(APP_NAME)
+
+
+def market_today(now: "dt.datetime | None" = None) -> dt.date:
+    """Today's calendar date in the job market's timezone.
+
+    Falls back to the UTC date when the platform ships no tz database. That
+    fallback is lenient rather than strict: it can keep a just-closed vacancy
+    eligible for a couple of hours, never the reverse.
+    """
+    moment = now or dt.datetime.now(UTC)
+    if _MARKET_TZ is None:
+        return moment.astimezone(UTC).date()
+    return moment.astimezone(_MARKET_TZ).date()
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +205,29 @@ class RateLimitError(RemoteAPIError):
 
 
 class TemporaryProviderError(RemoteAPIError):
-    """A transport, rate-limit, timeout, unavailable, or temporary 5xx failure."""
+    """A transport, rate-limit, timeout, unavailable, or temporary 5xx failure.
 
-    def __init__(self, provider: str, message: str) -> None:
+    Carries the HTTP status when there was one. Without it every cause -- a
+    rate limit, a 503, a socket timeout -- logs identically, and you cannot
+    tell afterwards which one you actually hit.
+    """
+
+    def __init__(self, provider: str, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.provider = provider
+        self.status = status
+
+    @property
+    def reason(self) -> str:
+        """Short, countable label for this failure.
+
+        Deliberately bounded: these become dictionary keys in the run record,
+        so an arbitrary provider message must never end up as one.
+        """
+        if self.status is not None:
+            return f"http_{self.status}"
+        match = re.search(r"transport failure:\s*(\w{1,40})", str(self))
+        return f"transport_{match.group(1)}" if match else "transport_unknown"
 
 
 class ModelOutputError(RemoteAPIError):
@@ -379,6 +421,9 @@ class RunStats:
     reasoning_tokens: int = 0
     total_tokens: int = 0
     fallback_calls: int = 0
+    # Why the transport fallback fired, keyed as http_429 / transport_TimeoutError.
+    fallback_reasons: dict[str, int] = dataclasses.field(default_factory=dict)
+    mode: str = "live"
     batches_processed: int = 0
     cleanup_batches: int = 0
     duplicates_suppressed: int = 0
@@ -760,6 +805,124 @@ class Database:
             )
         )
 
+    def historical_pending(
+        self,
+        profile_version: str,
+        limit: int,
+        *,
+        today: dt.date,
+    ) -> list[sqlite3.Row]:
+        """Unevaluated jobs frozen behind the live cutoff that are still open.
+
+        Deliberately separate from `pending_jobs`: the live selector is
+        untouched, and this one can never return a live job. Ordered by
+        urgency, because a recovery run should reach the vacancies closing
+        soonest first. Undated vacancies sort last, since they cannot expire.
+        """
+        live_since = self.get_meta("live_since")
+        if not live_since:
+            return []
+        return list(
+            self.conn.execute(
+                """
+                SELECT j.*
+                FROM jobs j
+                LEFT JOIN evaluations e
+                  ON e.job_id = j.id
+                 AND e.content_hash = j.content_hash
+                 AND e.profile_version = ?
+                WHERE e.id IS NULL
+                  AND j.content_changed_at < ?
+                  AND (j.application_deadline IS NULL
+                       OR j.application_deadline = ''
+                       OR substr(j.application_deadline, 1, 10) >= ?)
+                ORDER BY
+                    CASE WHEN j.application_deadline IS NULL
+                              OR j.application_deadline = '' THEN 1 ELSE 0 END,
+                    substr(j.application_deadline, 1, 10) ASC,
+                    j.discovery_score DESC,
+                    COALESCE(j.published_at, j.first_seen_at) DESC,
+                    j.id ASC
+                LIMIT ?
+                """,
+                (profile_version, live_since, today.isoformat(), limit),
+            )
+        )
+
+    def historical_counts(self, profile_version: str, *, today: dt.date) -> dict[str, int]:
+        """Read-only breakdown of the historical backlog. No provider calls."""
+        live_since = self.get_meta("live_since")
+        if not live_since:
+            return {}
+        horizon = {
+            "closing_today": 0,
+            "closing_tomorrow": 0,
+            "closing_within_3_days": 0,
+            "closing_within_7_days": 0,
+        }
+        rows = self.conn.execute(
+            """
+            SELECT j.application_deadline AS deadline, e.id AS evaluation_id
+            FROM jobs j
+            LEFT JOIN evaluations e
+              ON e.job_id = j.id
+             AND e.content_hash = j.content_hash
+             AND e.profile_version = ?
+            WHERE j.content_changed_at < ?
+            """,
+            (profile_version, live_since),
+        ).fetchall()
+
+        unevaluated = still_open = expired = evaluated = 0
+        for row in rows:
+            if row["evaluation_id"] is not None:
+                evaluated += 1
+                continue
+            unevaluated += 1
+            deadline = clean_text(row["deadline"])
+            if deadline and application_expired(deadline, today):
+                expired += 1
+                continue
+            still_open += 1
+            if not deadline:
+                continue
+            try:
+                days = (dt.date.fromisoformat(deadline[:10]) - today).days
+            except ValueError:
+                continue
+            if days <= 0:
+                horizon["closing_today"] += 1
+            elif days == 1:
+                horizon["closing_tomorrow"] += 1
+            if 0 <= days <= 3:
+                horizon["closing_within_3_days"] += 1
+            if 0 <= days <= 7:
+                horizon["closing_within_7_days"] += 1
+
+        awaiting = int(
+            self.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM evaluations e
+                JOIN jobs j ON j.id = e.job_id
+                LEFT JOIN notifications n ON n.evaluation_id = e.id
+                WHERE n.evaluation_id IS NULL
+                  AND e.decision IN ('notify_strong','notify_good','notify_stretch','notify_verify')
+                  AND j.content_changed_at < ?
+                """,
+                (live_since,),
+            ).fetchone()[0]
+        )
+        return {
+            "historical_total": len(rows),
+            "historical_unevaluated": unevaluated,
+            "historical_still_open_pending": still_open,
+            "historical_expired_unevaluated": expired,
+            "historical_evaluated": evaluated,
+            "historical_matches_awaiting_delivery": awaiting,
+            **horizon,
+        }
+
     def pending_count(self, profile_version: str, *, respect_live_mode: bool) -> int:
         live_since = self.get_meta("live_since") if respect_live_mode else None
         live_clause = ""
@@ -825,7 +988,17 @@ class Database:
                 ),
             )
 
-    def unnotified(self, limit: int) -> list[sqlite3.Row]:
+    def unnotified(self, limit: int, *, historical: bool = False) -> list[sqlite3.Row]:
+        live_since = self.get_meta("live_since")
+        scope_clause = ""
+        scope_params: tuple[Any, ...] = ()
+        if live_since:
+            comparison = "<" if historical else ">="
+            scope_clause = f"AND j.content_changed_at {comparison} ?"
+            scope_params = (live_since,)
+        elif historical:
+            # Nothing is historical until the backlog has been frozen.
+            return []
         return list(
             self.conn.execute(
                 """
@@ -852,10 +1025,11 @@ class Database:
                 LEFT JOIN notifications n ON n.evaluation_id=e.id
                 WHERE n.evaluation_id IS NULL
                   AND e.decision IN ('notify_strong','notify_good','notify_stretch','notify_verify')
+                  {scope_clause}
                 ORDER BY e.opportunity_score DESC, e.career_fit DESC, e.evaluated_at ASC
                 LIMIT ?
-                """,
-                (limit,),
+                """.format(scope_clause=scope_clause),
+                (*scope_params, limit),
             )
         )
 
@@ -1027,7 +1201,10 @@ def provider_json_request(
     except urllib.error.HTTPError as exc:
         message = f"{provider} returned HTTP {exc.code}"
         if exc.code in {408, 425, 429, 500, 502, 503, 504}:
-            raise TemporaryProviderError(provider, message) from exc
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            if retry_after:
+                message += f" (Retry-After: {retry_after})"
+            raise TemporaryProviderError(provider, message, status=exc.code) from exc
         raise RemoteAPIError(message) from exc
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
         raise TemporaryProviderError(provider, f"{provider} transport failure: {type(exc).__name__}") from exc
@@ -1272,18 +1449,34 @@ def evaluate_with_fallback(
     primary: ProviderMatcher,
     fallback: ProviderMatcher,
     jobs: Sequence[sqlite3.Row],
+    *,
+    stats: "RunStats | None" = None,
 ) -> tuple[ProviderBatchResult, bool]:
     """One primary call, and at most one fallback call for temporary transport failure."""
     try:
         return primary.evaluate(jobs), False
     except TemporaryProviderError as primary_error:
-        LOG.warning("%s temporarily unavailable; trying %s once", primary.provider, fallback.provider)
+        # Log the cause, not just the fact. A rate limit and a socket timeout
+        # need different responses, and they used to be indistinguishable.
+        LOG.warning(
+            "%s temporarily unavailable (%s); trying %s once",
+            primary.provider, primary_error, fallback.provider,
+        )
+        if stats is not None:
+            key = primary_error.reason
+            stats.fallback_reasons[key] = stats.fallback_reasons.get(key, 0) + 1
         try:
             return fallback.evaluate(jobs), True
         except TemporaryProviderError as fallback_error:
             expected_ids = frozenset(str(row["source_job_id"]) for row in jobs)
-            error = f"{primary.provider} temporary failure; {fallback.provider} temporary failure"
+            error = (
+                f"{primary.provider} temporary failure ({primary_error.reason}); "
+                f"{fallback.provider} temporary failure ({fallback_error.reason})"
+            )
             LOG.warning("%s: %s / %s", error, primary_error, fallback_error)
+            if stats is not None:
+                key = f"both_failed:{primary_error.reason}"
+                stats.fallback_reasons[key] = stats.fallback_reasons.get(key, 0) + 1
             return ProviderBatchResult(
                 provider=fallback.provider,
                 model=fallback.model,
@@ -1332,7 +1525,7 @@ def run_batch_pass(
             outcome.deferred.extend(remaining)
             return outcome
 
-        result, used_fallback = evaluate_with_fallback(primary, fallback, batch)
+        result, used_fallback = evaluate_with_fallback(primary, fallback, batch, stats=stats)
         if cleanup:
             stats.cleanup_batches += 1
         else:
@@ -1528,19 +1721,40 @@ def application_expired(deadline: str | None, today: dt.date | None = None) -> b
     return value < today
 
 
-def should_prefilter(job: JobRecord, settings: Settings) -> tuple[bool, str]:
-    if application_expired(job.application_deadline):
-        return True, "expired"
-    country = job.country.casefold()
+def job_field(job: Any, name: str) -> Any:
+    """Read one field from a JobRecord or from a stored `jobs` row."""
+    if isinstance(job, (sqlite3.Row, Mapping)):
+        try:
+            return job[name]
+        except (KeyError, IndexError):
+            return None
+    return getattr(job, name, None)
+
+
+def prefilter_reason(job: Any, settings: Settings, *, today: dt.date | None = None) -> str:
+    """Deterministic exclusions, shared by discovery and historical recovery.
+
+    Returns the reason to exclude, or "" to keep. `today` lets the caller pin
+    the calendar date; discovery leaves it unset and keeps its original UTC
+    behaviour, historical recovery passes the market date.
+    """
+    if application_expired(job_field(job, "application_deadline"), today):
+        return "expired"
+    country = str(job_field(job, "country") or "").casefold()
     if country and country not in {"sverige", "sweden"}:
-        return True, "outside_sweden"
-    if not job.fully_remote:
-        location = f"{job.municipality} {job.region}".casefold()
+        return "outside_sweden"
+    if not job_field(job, "fully_remote"):
+        location = f"{job_field(job, 'municipality')} {job_field(job, 'region')}".casefold()
         if any(term in location for term in settings.northern_exclusions):
-            return True, "excluded_northern_location"
-    if not job.description:
-        return True, "missing_description"
-    return False, ""
+            return "excluded_northern_location"
+    if not job_field(job, "description"):
+        return "missing_description"
+    return ""
+
+
+def should_prefilter(job: JobRecord, settings: Settings) -> tuple[bool, str]:
+    reason = prefilter_reason(job, settings)
+    return bool(reason), reason
 
 
 def discovery_score(job: JobRecord, settings: Settings) -> int:
@@ -2619,6 +2833,231 @@ def run_pipeline(settings: Settings, *, fetch_only: bool, evaluate_only: bool) -
         db.close()
 
 
+BACKFILL_REPORT_MAX_CHARS = 3500
+
+
+def select_historical_candidates(
+    db: "Database",
+    settings: Settings,
+    profile_version: str,
+    *,
+    today: dt.date,
+) -> tuple[list[sqlite3.Row], dict[str, int]]:
+    """Freeze one historical recovery snapshot, newest exclusions counted."""
+    rows = db.historical_pending(profile_version, settings.max_candidates_per_run, today=today)
+    excluded: dict[str, int] = {}
+    kept: list[sqlite3.Row] = []
+    for row in rows:
+        reason = prefilter_reason(row, settings, today=today)
+        if reason:
+            excluded[reason] = excluded.get(reason, 0) + 1
+            continue
+        kept.append(row)
+    return kept, excluded
+
+
+def summarize_deadlines(rows: Sequence[sqlite3.Row], limit: int = 20) -> list[str]:
+    out: list[str] = []
+    for row in rows[:limit]:
+        deadline = clean_text(row["application_deadline"])[:10] or "no deadline"
+        out.append(f"{deadline}  score {int(row['discovery_score']):>3}  {clean_text(row['title'])[:52]}")
+    return out
+
+
+def run_backfill(settings: Settings, *, dry_run: bool, limit: int | None = None) -> int:
+    """Evaluate historical jobs the live selector will never reach.
+
+    Deliberately has no discovery step and no delivery step. It writes
+    evaluations and nothing else: notification state belongs to
+    `backfill-report`, so running this over SSH can never consume a match that
+    was never actually delivered anywhere.
+    """
+    info = doctor(settings, require_key=not dry_run)
+    today = market_today()
+    db = Database(settings.db_path)
+    stats = RunStats(mode="backfill")
+    run_id: int | None = None
+    try:
+        version = info["profile_version"]
+        if not db.get_meta("live_since"):
+            print("Historical recovery needs a frozen backlog; this database is still in bootstrap mode.")
+            return 0
+
+        ceiling = settings.max_candidates_per_run if limit is None else max(1, limit)
+        settings = dataclasses.replace(settings, max_candidates_per_run=ceiling)
+        candidates, excluded = select_historical_candidates(db, settings, version, today=today)
+        snapshot, duplicates = suppress_duplicate_candidates(db, candidates)
+        stats.duplicates_suppressed = len(duplicates)
+        stats.snapshot_size = len(snapshot)
+        counts = db.historical_counts(version, today=today)
+        batches = list(
+            iter_batches(
+                snapshot,
+                max_jobs=settings.max_jobs_per_batch,
+                max_chars=settings.max_prompt_chars,
+                max_job_description_chars=settings.max_job_description_chars,
+            )
+        )
+
+        if dry_run:
+            remaining = counts.get("historical_still_open_pending", 0)
+            per_run = max(1, ceiling)
+            print("Historical backfill, DRY RUN. No provider calls, no writes.")
+            print(f"  market date (Europe/Stockholm) : {today.isoformat()}")
+            print(f"  live cutoff                    : {db.get_meta('live_since')}")
+            print(f"  selected this run              : {len(snapshot)} (ceiling {ceiling})")
+            print(f"  excluded by prefilter          : {excluded or 'none'}")
+            print(f"  reposts suppressed             : {len(duplicates)}")
+            print(f"  batches at {settings.max_jobs_per_batch}/call            : {len(batches)}")
+            print(f"  provider calls this run        : {len(batches)} (+ at most 1 cleanup pass)")
+            print(f"  still-open historical backlog  : {remaining}")
+            print(f"  estimated runs to drain        : {(remaining + per_run - 1) // per_run}")
+            print(f"  expired, never selected        : {counts.get('historical_expired_unevaluated', 0)}")
+            if snapshot:
+                print("  first selected, by urgency:")
+                for line in summarize_deadlines(snapshot):
+                    print(f"    {line}")
+            return 0
+
+        if not batches:
+            print("Historical backfill: nothing left to evaluate.")
+            return 0
+
+        # From here the run spends money, so it is recorded like any other run.
+        run_id = db.start_run()
+        secrets = load_secrets(settings.secrets_path)
+        matcher_profile, matcher_rules, _ = load_profile_bundle(settings)
+        primary = ProviderMatcher(settings, secrets, matcher_profile, matcher_rules, settings.primary_provider)
+        fallback = ProviderMatcher(settings, secrets, matcher_profile, matcher_rules, settings.fallback_provider)
+        deadline_at = time.monotonic() + settings.max_run_seconds
+        reserve = settings.gateway_timeout_seconds
+
+        LOG.info("Historical backfill: %d job(s) in %d batch(es)", len(snapshot), len(batches))
+        outcome = run_batch_pass(
+            db, primary, fallback, batches,
+            profile_version=version, stats=stats,
+            deadline=deadline_at, reserve_seconds=reserve,
+        )
+        # Same completeness contract as the live pipeline: one bounded,
+        # non-recursive cleanup pass, skipped when the provider already failed.
+        if outcome.unresolved and outcome.provider_error is None:
+            cleanup_batches = list(
+                iter_batches(
+                    outcome.unresolved,
+                    max_jobs=settings.max_jobs_per_batch,
+                    max_chars=settings.max_prompt_chars,
+                    max_job_description_chars=settings.max_job_description_chars,
+                )
+            )
+            LOG.info("Historical cleanup pass: %d unresolved ID(s)", len(outcome.unresolved))
+            cleanup = run_batch_pass(
+                db, primary, fallback, cleanup_batches,
+                profile_version=version, stats=stats,
+                deadline=deadline_at, reserve_seconds=reserve, cleanup=True,
+            )
+            outcome.unresolved = cleanup.unresolved + cleanup.deferred
+            if cleanup.provider_error:
+                outcome.provider_error = cleanup.provider_error
+
+        db.finish_run(
+            run_id,
+            "partial" if outcome.provider_error else "success",
+            stats,
+            compact_sentence(outcome.provider_error, 1000) if outcome.provider_error else None,
+        )
+        run_id = None
+
+        after = db.historical_counts(version, today=today)
+        print("Historical backfill:")
+        print(f"  {len(snapshot)} selected")
+        print(f"  {stats.evaluated} evaluated")
+        print(f"  {len(outcome.unresolved)} unresolved")
+        print(f"  {len(outcome.deferred)} deferred by the runtime budget")
+        print(f"  {after.get('historical_matches_awaiting_delivery', 0)} worthwhile matches stored, awaiting delivery")
+        print(f"  {after.get('historical_still_open_pending', 0)} open historical jobs remaining")
+        if outcome.provider_error:
+            print(f"  provider error: {compact_sentence(outcome.provider_error, 200)}")
+        print(f"  {stats.total_tokens:,} tokens · {stats.fallback_calls} transport fallback(s)"
+              + (f" {stats.fallback_reasons}" if stats.fallback_reasons else ""))
+        print("  nothing was delivered; run backfill-report to send stored matches")
+        return 0
+    except BaseException as exc:
+        if run_id is not None:
+            with contextlib.suppress(Exception):
+                db.finish_run(run_id, "error", stats, compact_sentence(exc, 1000))
+        raise
+    finally:
+        db.close()
+
+
+def run_backfill_report(settings: Settings, *, limit: int | None = None) -> int:
+    """Deliver stored historical matches, a bounded page at a time.
+
+    Only the cards actually printed are marked delivered, so a truncated or
+    undelivered page is retried rather than silently lost.
+    """
+    info = doctor(settings, require_key=False)
+    db = Database(settings.db_path)
+    try:
+        version = info["profile_version"]
+        today = market_today()
+        page = settings.max_notifications_per_run if limit is None else max(1, limit)
+        rows = db.unnotified(page, historical=True)
+        rows, duplicate_cards = deduplicate_notifications(rows)
+
+        emitted: list[sqlite3.Row] = []
+        message = ""
+        for row in rows:
+            candidate = format_notifications([*emitted, row])
+            if emitted and len(candidate) > BACKFILL_REPORT_MAX_CHARS:
+                break
+            emitted.append(row)
+            message = candidate
+
+        if emitted:
+            print(message, flush=True)
+            ids = [int(row["evaluation_id"]) for row in emitted]
+            ids += [int(row["evaluation_id"]) for row, _ in duplicate_cards]
+            db.mark_notifications_emitted(ids)
+        elif duplicate_cards:
+            db.mark_notifications_emitted([int(row["evaluation_id"]) for row, _ in duplicate_cards])
+
+        waiting = db.historical_counts(version, today=today).get("historical_matches_awaiting_delivery", 0)
+        if not emitted and not waiting:
+            print("\u2705 Historical recovery: all worthwhile open matches delivered.", flush=True)
+        elif waiting:
+            noun = "match" if waiting == 1 else "matches"
+            print(
+                f"\U0001f3af Historical recovery: {len(emitted)} delivered \u00b7 {waiting} {noun} still waiting.",
+                flush=True,
+            )
+        else:
+            print(
+                f"\u2705 Historical recovery: {len(emitted)} delivered \u00b7 none still waiting.",
+                flush=True,
+            )
+        return 0
+    finally:
+        db.close()
+
+
+def backfill_status(settings: Settings) -> dict[str, Any]:
+    info = doctor(settings, require_key=False)
+    db = Database(settings.db_path)
+    try:
+        today = market_today()
+        counts = db.historical_counts(info["profile_version"], today=today)
+        return {
+            "market_date": today.isoformat(),
+            "market_timezone": MARKET_TIMEZONE if _MARKET_TZ is not None else "UTC (no tz database)",
+            "live_since": db.get_meta("live_since"),
+            "candidates_per_run": settings.max_candidates_per_run,
+            **(counts or {"note": "database is in bootstrap mode; nothing is historical yet"}),
+        }
+    finally:
+        db.close()
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="RoleLens: semantic Swedish job discovery for script-only cron.",
@@ -2639,6 +3078,28 @@ def make_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "activate",
         help="Freeze the historical backlog and switch future runs to new/changed jobs only",
+    )
+
+    backfill = sub.add_parser(
+        "backfill",
+        help="Evaluate open historical jobs the live selector skips. Never delivers.",
+    )
+    backfill.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be selected. No provider calls, no writes.",
+    )
+    backfill.add_argument(
+        "--limit", type=int, default=None,
+        help="Override the per-run candidate ceiling for this invocation.",
+    )
+    sub.add_parser("backfill-status", help="Historical backlog counters. Read-only, free.")
+    report = sub.add_parser(
+        "backfill-report",
+        help="Deliver one bounded page of stored historical matches",
+    )
+    report.add_argument(
+        "--limit", type=int, default=None,
+        help="Cards in this page (default: max_notifications_per_run).",
     )
     return parser
 
@@ -2666,6 +3127,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             finally:
                 db.close()
             return 0
+        if command == "backfill-status":
+            print(json.dumps(backfill_status(settings), indent=2, ensure_ascii=False))
+            return 0
+        if command == "backfill":
+            if args.dry_run:
+                # Read-only and free, so it does not contend for the run lock.
+                return run_backfill(settings, dry_run=True, limit=args.limit)
+            with FileLock(settings.lock_path):
+                return run_backfill(settings, dry_run=False, limit=args.limit)
+        if command == "backfill-report":
+            with FileLock(settings.lock_path):
+                return run_backfill_report(settings, limit=args.limit)
         if command == "activate":
             db = Database(settings.db_path)
             try:

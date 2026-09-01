@@ -306,6 +306,8 @@ not inherit provider credentials from the scheduler.
 ## Architecture
 
 Full detail, including diagrams, is in [docs/architecture.md](docs/architecture.md).
+Day-to-day commands, scheduling and historical recovery are in
+[docs/operations.md](docs/operations.md).
 The short version:
 
 - **Retrieval** — Arbetsförmedlingen JobSearch, many cheap queries, no LLM.
