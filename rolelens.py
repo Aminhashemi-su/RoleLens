@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 APP_NAME = "rolelens"
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.5.3"
 SCHEMA_VERSION = "2"
 DEFAULT_HOME = Path.home() / ".rolelens"
 JOBSEARCH_BASE_URL = "https://jobsearch.api.jobtechdev.se"
@@ -47,6 +47,117 @@ RETRYABLE_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 UTC = dt.timezone.utc
 
 LOG = logging.getLogger(APP_NAME)
+
+
+# ---------------------------------------------------------------------------
+# Candidate language proficiency.
+#
+# The candidate's level is configuration, not code: it comes from
+# matcher_profile.json (`constraints.<language>`). Nothing here assumes a
+# particular candidate. An absent or unrecognised value stays UNKNOWN and is
+# never silently turned into a failure.
+# ---------------------------------------------------------------------------
+CEFR_SCALE: tuple[str, ...] = ("none", "A1", "A2", "B1", "B2", "C1", "C2")
+
+# Deterministic thresholds, so proficiency comparisons live in one place.
+#   PROFESSIONAL - what an advertisement means by "fluent/professional/advanced".
+#   WORKING      - close enough to penalise rather than hard-block, because a
+#                  false negative costs far more here than a wasted click.
+PROFESSIONAL_LANGUAGE_LEVEL = "C1"
+WORKING_LANGUAGE_LEVEL = "B2"
+
+_LANGUAGE_ALIASES: dict[str, str] = {
+    "none": "none", "no": "none", "nil": "none", "zero": "none", "ingen": "none",
+    "beginner": "A1", "basic": "A1", "elementary": "A1", "nyborjare": "A1",
+    "intermediate": "B1", "medel": "B1",
+    "upper intermediate": "B2", "upperintermediate": "B2",
+    "advanced": "C1", "professional": "C1", "business": "C1",
+    "professional working proficiency": "C1", "working proficiency": "C1",
+    "fluent": "C1", "flytande": "C1",
+    "native": "C2", "native speaker": "C2", "mother tongue": "C2",
+    "modersmal": "C2", "bilingual": "C2",
+}
+_CEFR_TOKEN = re.compile(r"\b([ABC][12])\b", re.IGNORECASE)
+_UNSPECIFIED = {
+    "", "unknown", "unspecified", "not specified", "not stated",
+    "n/a", "na", "none specified", "null",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class LanguageLevel:
+    """One candidate proficiency, comparable on the CEFR scale.
+
+    `rank` is None when the level is unknown. Unknown is a state of its own: it
+    is never treated as `none`, and it never satisfies a requirement.
+    """
+
+    label: str
+    rank: int | None
+
+    @property
+    def known(self) -> bool:
+        return self.rank is not None
+
+    def at_least(self, level: str) -> bool:
+        """True only when the level is known and reaches `level`."""
+        return self.rank is not None and self.rank >= CEFR_SCALE.index(level)
+
+    def describe(self, language: str) -> str:
+        if not self.known:
+            return f"{language} level is not specified in the candidate profile"
+        return f"{language} level is {self.label}"
+
+
+UNKNOWN_LANGUAGE_LEVEL = LanguageLevel("unknown", None)
+
+
+def normalize_language_level(value: Any) -> LanguageLevel:
+    """Parse a free-text proficiency into a comparable level.
+
+    Accepts 'A2', 'a2, progressing', 'Fluent', 'native speaker',
+    'B1 (intermediate)'. An explicit CEFR token always wins over a prose alias,
+    so 'A2, working towards fluent' resolves to A2 rather than to fluent.
+    """
+    if isinstance(value, Mapping):
+        value = value.get("level", "")
+    if not isinstance(value, str):
+        return UNKNOWN_LANGUAGE_LEVEL
+    text = " ".join(value.replace("å", "a").replace("ä", "a").replace("ö", "o").split())
+    folded = text.casefold()
+    if folded in _UNSPECIFIED:
+        return UNKNOWN_LANGUAGE_LEVEL
+
+    token = _CEFR_TOKEN.search(text)
+    if token is not None:
+        label = token.group(1).upper()
+        return LanguageLevel(label, CEFR_SCALE.index(label))
+
+    # Longest alias first, so "upper intermediate" beats "intermediate".
+    for alias in sorted(_LANGUAGE_ALIASES, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(alias)}\b", folded):
+            canonical = _LANGUAGE_ALIASES[alias]
+            label = alias if alias in {"fluent", "native"} else canonical
+            return LanguageLevel(label, CEFR_SCALE.index(canonical))
+    return UNKNOWN_LANGUAGE_LEVEL
+
+
+def candidate_language_level(profile: Mapping[str, Any], language: str = "swedish") -> LanguageLevel:
+    """Read one candidate language level from the matcher profile.
+
+    Looks at `constraints.<language>` first, which is where the existing schema
+    already keeps it, then at an optional `languages.<language>` map. Anything
+    missing or unparseable is UNKNOWN.
+    """
+    if not isinstance(profile, Mapping):
+        return UNKNOWN_LANGUAGE_LEVEL
+    constraints = profile.get("constraints")
+    if isinstance(constraints, Mapping) and language in constraints:
+        return normalize_language_level(constraints[language])
+    languages = profile.get("languages")
+    if isinstance(languages, Mapping) and language in languages:
+        return normalize_language_level(languages[language])
+    return UNKNOWN_LANGUAGE_LEVEL
 
 
 class RoleLensError(RuntimeError):
@@ -842,16 +953,38 @@ class JobSearchClient:
         )
 
 
-def semantic_system_prompt() -> str:
+def swedish_prompt_clause(level: LanguageLevel) -> str:
+    """Describe the configured Swedish level, and what follows from it."""
+    if not level.known:
+        return (
+            "The candidate's Swedish level is not specified in the profile. Treat Swedish proficiency as UNKNOWN: "
+            "do not assume it is sufficient and do not assume it is missing. "
+        )
+    if level.at_least(PROFESSIONAL_LANGUAGE_LEVEL):
+        return (
+            f"Candidate Swedish is {level.label}, which meets professional/fluent Swedish requirements. "
+        )
+    if level.at_least(WORKING_LANGUAGE_LEVEL):
+        return (
+            f"Candidate Swedish is {level.label}, below full professional proficiency but close to it. "
+            "Treat explicit mandatory professional/fluent Swedish as a partial gap and a material risk, not an absolute bar. "
+        )
+    return (
+        f"Candidate Swedish is {level.label}, below professional working proficiency. "
+    )
+
+
+def semantic_system_prompt(swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL) -> str:
     return (
         "You are an evidence-disciplined semantic career matcher for Swedish job discovery. "
         "Evaluate what the person would actually do, not the advertised title. Understand English and Swedish. "
         "Use only candidate evidence supplied below; never invent experience or turn unknown facts into unmet facts. "
         "Score career_fit only for long-term role/content alignment. Practical constraints such as language, location, "
         "citizenship, clearance, or timing belong in opportunity_score and blockers, never career_fit. "
-        "Swedish is A2 and progressing. A Swedish-language advertisement alone is not a Swedish-language requirement. "
-        "Only explicit mandatory fluent/professional/advanced Swedish is unmet and a hard blocker; preferred or optional "
-        "Swedish is not a blocker. Ordinary background/security screening does not imply citizenship or clearance eligibility. "
+        + swedish_prompt_clause(swedish) +
+        "A Swedish-language advertisement alone is not a Swedish-language requirement. "
+        "Judge explicit mandatory fluent/professional/advanced Swedish against the candidate level stated above; preferred or optional "
+        "Swedish is never a blocker. Ordinary background/security screening does not imply citizenship or clearance eligibility. "
         "If citizenship or security eligibility is explicitly required and candidate evidence does not resolve it, preserve UNKNOWN. "
         "Unknown years of experience are unknown or partial, not automatically unmet. Founder/CTO titles are not proof of "
         "staff-level seniority. Return exactly one evaluation for every supplied source_job_id, no duplicates and no other IDs. "
@@ -979,6 +1112,7 @@ def parse_provider_evaluations(
     provider: str,
     model: str,
     usage: dict[str, int],
+    swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL,
 ) -> ProviderBatchResult:
     expected = {str(row["source_job_id"]): row for row in jobs}
     expected_ids = set(expected)
@@ -1019,7 +1153,7 @@ def parse_provider_evaluations(
         if item_id in duplicates:
             continue
         try:
-            accepted[item_id] = validate_evaluation(item, job=expected[item_id])
+            accepted[item_id] = validate_evaluation(item, job=expected[item_id], swedish=swedish)
         except RemoteAPIError as exc:
             errors.append(f"{item_id}: {compact_sentence(exc, 140)}")
     if unknown_ids:
@@ -1056,6 +1190,8 @@ class ProviderMatcher:
         self.matcher_profile = matcher_profile
         self.matcher_rules = matcher_rules
         self.provider = provider
+        # Candidate proficiency is configuration; the engine never assumes a level.
+        self.swedish = candidate_language_level(matcher_profile, "swedish")
         if provider == PRIMARY_PROVIDER:
             self.model = secrets.get("VERTEX_GEMINI_MODEL", "")
             self.api_key = secrets.get("VERTEX_GEMINI_API_KEY", "")
@@ -1079,7 +1215,7 @@ class ProviderMatcher:
             return ProviderBatchResult(self.provider, self.model, (), expected_ids, empty_usage())
         payload_jobs = [row_to_model_job(row, self.settings.max_job_description_chars) for row in jobs]
         user_payload = {"candidate": self.matcher_profile, "matching_rules": self.matcher_rules, "jobs": payload_jobs}
-        system_prompt = semantic_system_prompt()
+        system_prompt = semantic_system_prompt(self.swedish)
         if self.provider == PRIMARY_PROVIDER:
             request_payload = {
                 "systemInstruction": {"parts": [{"text": system_prompt}]},
@@ -1125,7 +1261,9 @@ class ProviderMatcher:
             return ProviderBatchResult(self.provider, self.model, (), expected_ids, exc.usage,
                                        compact_sentence(exc, 500), "output")
 
-        result = parse_provider_evaluations(content, jobs, provider=self.provider, model=self.model, usage=usage)
+        result = parse_provider_evaluations(
+            content, jobs, provider=self.provider, model=self.model, usage=usage, swedish=self.swedish
+        )
         archive_model_response(self.settings, self.provider, content, failure=bool(result.error))
         return result
 
@@ -1788,7 +1926,80 @@ def mentions(value: Any, terms: Sequence[str]) -> bool:
     return any(term in folded for term in terms)
 
 
-def normalize_evaluation_policy(item: Mapping[str, Any], job: Mapping[str, Any]) -> dict[str, Any]:
+def mandatory_language_outcome(level: LanguageLevel, language: str = "Swedish") -> dict[str, Any]:
+    """Resolve an explicit mandatory professional/fluent requirement.
+
+    The whole candidate-specific part of the Swedish policy lives here, driven
+    by the configured level rather than by a level baked into the code.
+
+      >= PROFESSIONAL (C1)  met      no blocker
+      == WORKING (B2)       partial  strong blocker, opportunity capped at 69
+      <= B1                 unmet    hard blocker,   opportunity capped at 49
+      unknown               unknown  unknown blocker, no cap, never "unmet"
+    """
+    if not level.known:
+        return {
+            "status": "unknown",
+            "blocker": "unknown",
+            "cap": None,
+            "reason": (
+                f"The advertisement requires professional {language}, and the candidate profile "
+                f"does not state a {language} level. Verify before applying."
+            ),
+            "risk": (
+                f"Unknown: the ad requires professional {language} and the profile does not state a level."
+            ),
+            "change": "mandatory_language_unknown_preserved",
+        }
+    if level.at_least(PROFESSIONAL_LANGUAGE_LEVEL):
+        return {
+            "status": "met",
+            "blocker": None,
+            "cap": None,
+            "reason": (
+                f"The advertisement requires professional {language}; candidate {language} is "
+                f"{level.label}, which meets it."
+            ),
+            "risk": f"None: candidate {language} is {level.label}.",
+            "change": "mandatory_language_met",
+        }
+    if level.at_least(WORKING_LANGUAGE_LEVEL):
+        return {
+            "status": "partial",
+            "blocker": "strong",
+            "cap": 69,
+            "reason": (
+                f"The advertisement requires professional {language}; candidate {language} is "
+                f"{level.label}, below full professional proficiency."
+            ),
+            "risk": (
+                f"Material risk: the ad requires professional {language} and candidate {language} "
+                f"is {level.label}."
+            ),
+            "change": "mandatory_language_partial",
+        }
+    return {
+        "status": "unmet",
+        "blocker": "hard",
+        "cap": 49,
+        "reason": (
+            f"The advertisement explicitly requires professional {language}; candidate {language} "
+            f"is {level.label}."
+        ),
+        "risk": (
+            f"Hard blocker: the ad explicitly requires professional {language} and candidate "
+            f"{language} is {level.label}."
+        ),
+        "change": "mandatory_swedish_enforced",
+    }
+
+
+def normalize_evaluation_policy(
+    item: Mapping[str, Any],
+    job: Mapping[str, Any],
+    *,
+    swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL,
+) -> dict[str, Any]:
     """Apply narrow, auditable policy facts before deriving the decision."""
     normalized = dict(item)
     description = clean_text(job["description"])
@@ -1800,22 +2011,27 @@ def normalize_evaluation_policy(item: Mapping[str, Any], job: Mapping[str, Any])
     optional_swedish = matches_any(description, SWEDISH_OPTIONAL_PATTERNS) or negated_swedish
     mandatory_swedish = matches_any(description, SWEDISH_MANDATORY_PATTERNS) and not negated_swedish
     if mandatory_swedish:
+        outcome = mandatory_language_outcome(swedish)
         swedish_rows = [x for x in must_haves if mentions(x.get("requirement"), ("swedish", "svenska"))]
         if swedish_rows:
             for row in swedish_rows:
-                row["status"] = "unmet"
-                row["reason"] = "Explicit mandatory Swedish proficiency; candidate level is A2."
+                row["status"] = outcome["status"]
+                row["reason"] = outcome["reason"]
         else:
             must_haves.append({
                 "requirement": "Mandatory Swedish proficiency",
-                "status": "unmet",
-                "reason": "Explicit mandatory Swedish proficiency; candidate level is A2.",
+                "status": outcome["status"],
+                "reason": outcome["reason"],
             })
         blockers = [x for x in blockers if not mentions(x.get("reason"), ("swedish", "svenska"))]
-        blockers.append({"type": "hard", "reason": "Mandatory Swedish proficiency is unmet at A2."})
-        normalized["opportunity_score"] = min(bounded_int(item.get("opportunity_score"), "opportunity_score"), 49)
-        normalized["language_risk"] = "Hard blocker: the ad explicitly requires Swedish proficiency above A2."
-        changes.append("mandatory_swedish_enforced")
+        if outcome["blocker"] is not None:
+            blockers.append({"type": outcome["blocker"], "reason": outcome["reason"]})
+        if outcome["cap"] is not None:
+            normalized["opportunity_score"] = min(
+                bounded_int(item.get("opportunity_score"), "opportunity_score"), outcome["cap"]
+            )
+        normalized["language_risk"] = outcome["risk"]
+        changes.append(outcome["change"])
     else:
         # Being written in Swedish, or merely preferring Swedish, is not a must-have.
         must_haves = [x for x in must_haves if not mentions(x.get("requirement"), ("swedish", "svenska"))]
@@ -1894,8 +2110,15 @@ def classify_decision(career_fit: int, opportunity: int, blockers: Sequence[Mapp
     return "store_no_notify"
 
 
-def validate_evaluation(item: Mapping[str, Any], *, job: Mapping[str, Any] | None = None) -> Evaluation:
-    normalized = normalize_evaluation_policy(item, job) if job is not None else dict(item)
+def validate_evaluation(
+    item: Mapping[str, Any],
+    *,
+    job: Mapping[str, Any] | None = None,
+    swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL,
+) -> Evaluation:
+    normalized = (
+        normalize_evaluation_policy(item, job, swedish=swedish) if job is not None else dict(item)
+    )
     item = normalized
     source_job_id = clean_text(item.get("source_job_id"))
     if not source_job_id:
@@ -2051,6 +2274,30 @@ def compact_sentence(value: Any, limit: int) -> str:
     return text[: max(1, limit - 1)].rstrip() + "…"
 
 
+# A profile file still carrying these has been installed from a template and
+# not yet personalised. Cheap, deterministic, and no provider call.
+TEMPLATE_MARKERS: tuple[str, ...] = (
+    "THIS IS A SYNTHETIC EXAMPLE",
+    "SYNTHETIC EXAMPLE CANDIDATE",
+    "(fictional)",
+    "profile_status\": \"example",
+)
+
+
+def unedited_templates(settings: Settings) -> list[str]:
+    """Profile files that still look like the shipped examples."""
+    still_template: list[str] = []
+    for name in ("career_profile.json", "matcher_profile.json", "search_lenses.json"):
+        path = settings.profile_dir / name
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if any(marker in text for marker in TEMPLATE_MARKERS):
+            still_template.append(name)
+    return still_template
+
+
 def doctor(settings: Settings, *, require_key: bool = True) -> dict[str, Any]:
     settings.home.mkdir(parents=True, exist_ok=True)
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2062,7 +2309,10 @@ def doctor(settings: Settings, *, require_key: bool = True) -> dict[str, Any]:
     ]
     missing = [str(path) for path in required if not path.exists()]
     if missing:
-        raise ConfigurationError("Missing profile files: " + ", ".join(missing))
+        raise ConfigurationError(
+            "Missing profile files: " + ", ".join(missing)
+            + ". Run install.sh to create them from the shipped examples."
+        )
     if settings.primary_provider != PRIMARY_PROVIDER or settings.fallback_provider != FALLBACK_PROVIDER:
         raise ConfigurationError(
             f"Production routing is fixed to {PRIMARY_PROVIDER} with {FALLBACK_PROVIDER} fallback"
@@ -2078,11 +2328,36 @@ def doctor(settings: Settings, *, require_key: bool = True) -> dict[str, Any]:
         "AZURE_OPENAI_DEPLOYMENT",
     )
     missing_keys = [key for key in required_keys if not secrets.get(key)]
+    templates = unedited_templates(settings)
     if require_key and missing_keys:
+        hint = ""
+        if templates:
+            hint = (
+                " Also still unedited: " + ", ".join(templates)
+                + " in " + str(settings.profile_dir) + "."
+            )
         raise ConfigurationError(
             "Missing provider configuration in "
-            f"{settings.secrets_path}: {', '.join(missing_keys)}"
+            f"{settings.secrets_path}: {', '.join(missing_keys)}.{hint}"
         )
+    swedish = candidate_language_level(matcher_profile, "swedish")
+    todo: list[str] = []
+    if templates:
+        todo.append(
+            "Personalise " + ", ".join(templates) + " in " + str(settings.profile_dir)
+            + " - they still contain the shipped example candidate."
+        )
+    if missing_keys:
+        todo.append(
+            "Add " + ", ".join(missing_keys) + " to " + str(settings.secrets_path)
+            + " (chmod 600)."
+        )
+    if not swedish.known:
+        todo.append(
+            "Set constraints.swedish in matcher_profile.json - the Swedish level is "
+            "unspecified, so language requirements stay UNKNOWN rather than judged."
+        )
+
     return {
         "home": str(settings.home),
         "database": str(settings.db_path),
@@ -2091,10 +2366,15 @@ def doctor(settings: Settings, *, require_key: bool = True) -> dict[str, Any]:
         "profile_version": version,
         "queries_per_run": len(build_queries(settings)),
         "provider_credentials_present": not missing_keys,
+        "missing_credentials": missing_keys,
         "profile_keys": len(matcher_profile),
         "rules_keys": len(matcher_rules),
+        "unedited_example_profiles": templates,
+        "candidate_swedish_level": swedish.label,
         "max_candidates_per_run": settings.max_candidates_per_run,
         "max_jobs_per_batch": settings.max_jobs_per_batch,
+        "ready": not missing_keys and not templates,
+        "next_steps": todo,
     }
 
 

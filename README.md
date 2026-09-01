@@ -104,49 +104,76 @@ git clone https://github.com/Aminhashemi-su/RoleLens.git
 cd RoleLens
 ```
 
-**1. Create your own configuration and profile from the examples.** The real
-files are in `.gitignore`, so your CV and your search terms never end up in a
-commit.
-
-```bash
-cp config.example.json                   config.json
-cp profile/career_profile.example.json   profile/career_profile.json
-cp profile/matcher_profile.example.json  profile/matcher_profile.json
-cp profile/search_lenses.example.json    profile/search_lenses.json
-```
-
-Then edit them. `matcher_profile.json` is the one that matters most: it is the
-compact profile actually sent to the model on every run. `career_profile.json`
-is your fuller evidence base, kept locally so the compact profile can be derived
-from something concrete — RoleLens never sends it to a provider.
-
-**2. Install.**
+**1. Install.** This creates `~/.rolelens/` and fills in anything that is
+missing from the shipped examples. It never overwrites a file you already have.
 
 ```bash
 chmod +x install.sh
 ./install.sh
 ```
 
-This creates `~/.rolelens/` (config, profile, data) and copies the script to
-`~/.local/scripts/`. Override either location with `ROLELENS_HOME` and
-`ROLELENS_SCRIPTS_HOME`.
+```text
+~/.rolelens/
+  config.json                      <- from config.example.json
+  secrets.env                      <- from secrets.env.example, mode 600
+  profile/career_profile.json      <- from career_profile.example.json
+  profile/matcher_profile.json     <- from matcher_profile.example.json
+  profile/search_lenses.json       <- from search_lenses.example.json
+  profile/matcher_rules_v1_1.json
+  data/
+~/.local/scripts/rolelens.py
+```
+
+Override either location with `ROLELENS_HOME` and `ROLELENS_SCRIPTS_HOME`.
+Re-running the installer refreshes `rolelens.py` and leaves everything else
+alone; `./install.sh --refresh-config` opts into overwriting config and profile
+from the checkout, and still never touches `secrets.env`.
+
+**2. Make the profile yours.** Everything installed above describes a fictional
+example candidate, so RoleLens will happily match jobs for someone who does not
+exist until you edit it.
+
+```bash
+$EDITOR ~/.rolelens/profile/matcher_profile.json   # the one sent to the model
+$EDITOR ~/.rolelens/profile/career_profile.json    # your local evidence base
+$EDITOR ~/.rolelens/config.json                    # search terms and locations
+```
+
+`matcher_profile.json` is the one that matters most: it is the compact profile
+actually sent to the model on every run. `career_profile.json` is your fuller
+evidence base, kept locally so the compact profile can be derived from something
+concrete — RoleLens never sends it to a provider.
+
+**Set your language level** while you are in there:
+
+```json
+"constraints": { "swedish": "A2, progressing" }
+```
+
+See [Language proficiency](#language-proficiency) below. This value is
+configuration, not code — nothing in `rolelens.py` assumes a level.
 
 **3. Add provider credentials.**
 
 ```bash
-cp secrets.env.example ~/.rolelens/secrets.env
 $EDITOR ~/.rolelens/secrets.env
 chmod 600 ~/.rolelens/secrets.env
 ```
 
-**4. Validate, then spend money deliberately.**
+**4. Check the installation, then spend money deliberately.**
 
 ```bash
-python3 ~/.local/scripts/rolelens.py doctor            # config only, no network
+python3 ~/.local/scripts/rolelens.py doctor            # config only, no network, no cost
 python3 ~/.local/scripts/rolelens.py --verbose fetch    # discovery only, zero LLM cost
 python3 ~/.local/scripts/rolelens.py status             # local counters
 python3 ~/.local/scripts/rolelens.py --verbose evaluate  # first step that calls a provider
 ```
+
+`doctor` tells you exactly what is still outstanding. It reports
+`unedited_example_profiles` while the profile is still the shipped example,
+`missing_credentials` until `secrets.env` is filled in, the resolved
+`candidate_swedish_level`, and `ready: true` once both are done. It makes no
+provider calls and costs nothing.
 
 **5. Switch from backlog to live.** The first `fetch` stores a large historical
 backlog. When you are ready to stop evaluating it and only see new or changed
@@ -205,6 +232,45 @@ queue a single run will hold in memory, the other bounds wall clock. A normal
 run never reaches either. When the candidate ceiling *is* reached the run says
 so explicitly in its summary, because a truncated snapshot is not a complete
 picture of the market and must not be reported as one.
+
+### Language proficiency
+
+The candidate's proficiency lives in `matcher_profile.json`, never in the code:
+
+```json
+"constraints": {
+  "swedish": "A2, progressing"
+}
+```
+
+Accepted values are CEFR levels (`none`, `A1`–`C2`) or plain words that map onto
+them: `beginner`/`basic` → A1, `intermediate` → B1, `upper intermediate` → B2,
+`advanced`/`professional`/`fluent` → C1, `native` → C2. Case does not matter, and
+surrounding prose is fine — `"A2, progressing"` and `"B1 (intermediate)"` both
+work. An explicit CEFR token always wins, so `"A2, working towards fluent"` is
+read as A2.
+
+When an advertisement **explicitly requires** professional, fluent or advanced
+Swedish, the policy layer resolves it against your configured level:
+
+| Your level | Outcome |
+|---|---|
+| C1, C2, fluent, native | **met** — no blocker |
+| B2 | **partial** — strong blocker, `opportunity_score` capped at 69 |
+| B1, A2, A1, none | **unmet** — hard blocker, `opportunity_score` capped at 49 |
+| missing or unparseable | **unknown** — no blocker, no cap, never "unmet" |
+
+C1 is the threshold for "professional working proficiency". B2 is deliberately
+penalised rather than hard-blocked: it is close enough that auto-rejecting risks
+hiding a good role, and a hidden role costs far more here than a wasted click.
+
+Unknown is a state of its own. A missing level is never read as "none" and never
+becomes "unmet" — the requirement stays unresolved and `doctor` tells you the
+level is unspecified.
+
+None of this applies to a merely *preferred* Swedish requirement, or to an
+advertisement that simply happens to be written in Swedish. Those are never
+blockers at any level.
 
 ### Scheduler timeout
 
@@ -293,12 +359,14 @@ Only then is the decision computed, from validated numbers:
 python3 -m unittest discover -s tests -v
 ```
 
-73 tests. No network, no API key, no cost. They cover the decision classifier,
+109 tests. No network, no API key, no cost. They cover the decision classifier,
 the Swedish-language policy rules, provider routing and fallback semantics,
 database idempotency and re-queueing on content change, snapshot completeness,
 completeness gaps versus transport failures, the bounded cleanup pass, global
 ranking and delivery ordering, the emergency runtime budget and candidate
-ceiling, repost suppression, and the run-summary wording in every state.
+ceiling, repost suppression, the run-summary wording in every state, the
+language-level scale and policy at every level, fresh-clone installation, and
+the doctor onboarding states.
 
 ---
 
@@ -354,7 +422,7 @@ Methodology and results are in
 
 ## Project status
 
-Version **1.5.2**. Running daily in production for a single user, against the
+Version **1.5.3**. Running daily in production for a single user, against the
 Swedish market, since 2026. It is a personal tool published because the design
 is more broadly interesting, not a product.
 
@@ -363,8 +431,6 @@ It is deliberately narrow:
 - One source (Arbetsförmedlingen JobSearch) and one market.
 - One candidate profile per installation.
 - One primary provider and one transport fallback; routing is fixed in code.
-- The candidate's Swedish CEFR level is currently referenced in the policy layer
-  and the system prompt rather than read from the profile.
 - Adjacent and specialist roles are still the weakest judgment area, and it
   over-notifies there.
 - Output is stdout only; delivery is whatever your scheduler does with it.

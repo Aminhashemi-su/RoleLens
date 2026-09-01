@@ -245,9 +245,9 @@ def extract(provider: str, response: Mapping[str, Any]) -> tuple[str, dict[str, 
 # --------------------------------------------------------------------------
 # The part that matters: replay through the real policy layer
 # --------------------------------------------------------------------------
-def apply_policy(item: Mapping[str, Any], job: Mapping[str, Any]) -> dict[str, Any]:
+def apply_policy(item: Mapping[str, Any], job: Mapping[str, Any], swedish: Any) -> dict[str, Any]:
     """Run one raw model evaluation through RoleLens's deterministic layer."""
-    normalized = cs.normalize_evaluation_policy(item, job)
+    normalized = cs.normalize_evaluation_policy(item, job, swedish=swedish)
     decision = cs.classify_decision(
         cs.bounded_int(normalized.get("career_fit"), "career_fit"),
         cs.bounded_int(normalized.get("opportunity_score"), "opportunity_score"),
@@ -268,7 +268,7 @@ def apply_policy(item: Mapping[str, Any], job: Mapping[str, Any]) -> dict[str, A
     }
 
 
-def parse_batch(content: str, batch: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def parse_batch(content: str, batch: Sequence[Mapping[str, Any]], swedish: Any) -> dict[str, Any]:
     """Structural validation first, then the policy layer. Mirrors production."""
     expected = {case["source_job_id"]: case for case in batch}
     out: dict[str, Any] = {"evaluations": {}, "errors": [], "missing": [], "unexpected": [], "duplicates": []}
@@ -306,7 +306,7 @@ def parse_batch(content: str, batch: Sequence[Mapping[str, Any]]) -> dict[str, A
         if key in out["duplicates"]:
             continue
         try:
-            out["evaluations"][key] = apply_policy(item, expected[key]["job"])
+            out["evaluations"][key] = apply_policy(item, expected[key]["job"], swedish)
         except Exception as exc:  # noqa: BLE001 - benchmark records, never crashes
             out["errors"].append(f"{key}: {exc}")
     out["missing"] = sorted(set(expected) - set(out["evaluations"]))
@@ -407,10 +407,12 @@ def score_results(cases: Mapping[str, Any], result: Mapping[str, Any]) -> dict[s
 def cmd_dry_run(args: argparse.Namespace) -> int:
     cases = load_cases(args.cases)
     candidate, rules = profile_bundle(args.root, cases)
-    prompt = cs.semantic_system_prompt()
+    swedish = cs.candidate_language_level(candidate, "swedish")
+    prompt = cs.semantic_system_prompt(swedish)
     print(f"cases file      : {args.cases}")
     print(f"candidate       : {cases.get('candidate')}")
     print(f"rules           : {cases.get('rules')}")
+    print(f"candidate swedish: {swedish.label}")
     print(f"system prompt   : {len(prompt)} chars, sha256 {hashlib.sha256(prompt.encode()).hexdigest()[:16]}")
     print(f"batches         : {len(cases['_batches'])}")
     total_chars = 0
@@ -439,7 +441,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     candidate, rules = profile_bundle(args.root, cases)
     secrets = load_secrets(args.secrets)
     spec = provider_spec(args.provider, secrets)
-    prompt = cs.semantic_system_prompt()
+    swedish = cs.candidate_language_level(candidate, "swedish")
+    prompt = cs.semantic_system_prompt(swedish)
 
     merged: dict[str, Any] = {}
     errors: list[str] = []
@@ -461,7 +464,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         write_json(raw_dir / f"batch_{index:02d}.json", {"content": content, "usage": usage, "latency_seconds": round(latency, 3)})
         for key in usage_total:
             usage_total[key] += int(usage.get(key) or 0)
-        parsed = parse_batch(content, batch)
+        parsed = parse_batch(content, batch, swedish)
         if not parsed["errors"] and not parsed["missing"] and not parsed["unexpected"] and not parsed["duplicates"]:
             valid_batches += 1
         merged.update(parsed["evaluations"])
@@ -476,6 +479,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "provider": args.provider,
         "model": spec["model"],
+        "candidate_swedish_level": swedish.label,
         "cases_file": str(args.cases),
         "batches_total": len(cases["_batches"]),
         "batches_valid": valid_batches,
@@ -498,6 +502,8 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_replay(args: argparse.Namespace) -> int:
     """Re-derive decisions from stored raw content, using the current policy layer."""
     cases = load_cases(args.cases)
+    candidate, _rules = profile_bundle(args.root, cases)
+    swedish = cs.candidate_language_level(candidate, "swedish")
     stored = read_json(args.result)
     raw_dir = args.result.parent / "raw" / str(stored["provider"])
     if not raw_dir.exists():
@@ -512,7 +518,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
             errors.append(f"missing raw batch {index}")
             missing.extend(case["source_job_id"] for case in batch)
             continue
-        parsed = parse_batch(read_json(path)["content"], batch)
+        parsed = parse_batch(read_json(path)["content"], batch, swedish)
         if not parsed["errors"] and not parsed["missing"]:
             valid += 1
         merged.update(parsed["evaluations"])

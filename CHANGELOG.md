@@ -3,10 +3,56 @@
 RoleLens was developed under an earlier internal name before this repository
 existed, so V1.1–V1.4 have no individual Git commits. This file records the
 known major versions instead. Version 1.5.1 is the first state captured in
-Git; 1.5.2 is the current release.
+Git; 1.5.3 is the current release.
 
 The format is loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project does not follow strict semantic versioning.
+
+## [1.5.3] — 2026-09-01
+
+Release hardening. No change to how vacancies are discovered, evaluated, ranked
+or delivered.
+
+### Fixed
+- **Candidate language proficiency is read from the profile rather than
+  hardcoded in the engine.** The system prompt and the deterministic policy
+  layer contained a literal candidate language level. The level now comes from
+  `matcher_profile.json` → `constraints.<language>`, and every explanation is
+  generated from it. Configure a different level and the policy follows, with no
+  code change.
+- **Fresh-clone installation now works.** `install.sh` expected files that a
+  clean clone does not ship, and failed with `install: cannot stat`. Missing
+  configuration and profile files are now created from the shipped
+  `*.example.json` templates.
+- **Re-installing no longer overwrites your files.** Existing configuration,
+  profile and `secrets.env` are kept. `--refresh-config` opts into overwriting
+  config and profile; `secrets.env` is never touched either way. A missing
+  template now fails loudly instead of creating empty configuration.
+
+### Added
+- Deterministic language-level normalisation: an ordered CEFR scale
+  (`none < A1 < A2 < B1 < B2 < C1 < C2`) with aliases for
+  beginner/intermediate/advanced/professional/fluent/native, case-insensitive
+  and tolerant of surrounding prose. Unknown is a distinct state that never
+  satisfies a requirement and is never treated as `none`.
+- A documented threshold for what satisfies "professional/fluent" language
+  requirements: **C1**. B2 is penalised with a strong blocker rather than hard
+  blocked; B1 and below are hard blocked; unknown stays unknown.
+- `doctor` distinguishes the onboarding states — file missing, example template
+  still unedited, credentials missing, ready — and reports
+  `candidate_swedish_level`, `unedited_example_profiles`, `missing_credentials`,
+  `ready` and `next_steps`. It still makes no provider calls.
+- `install.sh --refresh-config` and `--help`.
+- 36 new tests (73 → 109) covering language-level parsing and ordering, policy
+  outcome at every level, prompt generation, fresh-clone installation,
+  non-overwrite on re-install, and the doctor states.
+
+### Notes
+- Swedish detection patterns are unchanged; they are application policy, not
+  candidate configuration.
+- The example profile still ships `"swedish": "A2, progressing"` so the sample
+  benchmark keeps demonstrating a genuine language blocker. That value is
+  example data — change it and the behaviour changes with it.
 
 ## [1.5.2] — 2026-09-01
 

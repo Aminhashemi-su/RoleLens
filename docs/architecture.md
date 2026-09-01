@@ -336,7 +336,27 @@ flowchart TD
 Every branch is a narrow, testable rule with an audit trail: the changes it made
 are recorded in `_policy_changes` on the normalized item.
 
-The Swedish rules are regex sets over the advertisement text:
+The candidate's own proficiency is **not** in this code. It is read once from
+`matcher_profile.json` → `constraints.<language>`, normalised onto an ordered
+CEFR scale (`none < A1 < A2 < B1 < B2 < C1 < C2`), and passed into the policy
+layer. `mandatory_language_outcome()` is the single place that resolves an
+explicit mandatory requirement against it:
+
+| Configured level | Status | Blocker | `opportunity_score` |
+|---|---|---|---|
+| `>= C1` (also fluent, native) | met | none | untouched |
+| `B2` | partial | strong | capped at 69 |
+| `<= B1` | unmet | hard | capped at 49 |
+| unknown / unparseable | unknown | unknown | untouched |
+
+C1 is the documented threshold for "professional working proficiency". Unknown
+is a state of its own: it never satisfies a requirement, is never read as
+`none`, and never becomes `unmet`. Every explanation string is generated from
+the configured level, so no candidate-specific value exists in the engine.
+
+The *detection* rules are a different thing, and they do stay in code — they are
+application policy, not candidate configuration. They are regex sets over the
+advertisement text:
 `SWEDISH_MANDATORY_PATTERNS` (including the word-order variants
 `svenska i tal och skrift` and `tal och skrift på svenska`),
 `SWEDISH_OPTIONAL_PATTERNS` (merit, meriterande, preferred, a plus), and

@@ -5,8 +5,10 @@ import datetime as dt
 import importlib.util
 import io
 import json
+import os
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -243,10 +245,19 @@ class SwedishLanguagePolicyTests(unittest.TestCase):
         "location_note": "Stockholm",
     }
 
-    def policy(self, description, **overrides):
+    def policy(self, description, level="A2", **overrides):
+        """Run the policy layer for a candidate at `level`.
+
+        The level is passed explicitly because the engine no longer assumes one;
+        A2 is the default here only so these pre-existing guards keep testing the
+        blocking case they were written for.
+        """
         item = dict(self.BASE)
         item.update(overrides)
-        return cs.normalize_evaluation_policy(item, {"description": description})
+        return cs.normalize_evaluation_policy(
+            item, {"description": description},
+            swedish=cs.normalize_language_level(level),
+        )
 
     def test_explicit_swedish_not_required_is_not_a_blocker(self):
         # The ad states that knowledge of Swedish is explicitly NOT required.
@@ -288,6 +299,207 @@ class SwedishLanguagePolicyTests(unittest.TestCase):
         out = self.policy(description)
         self.assertNotIn("mandatory_swedish_enforced", out["_policy_changes"])
         self.assertEqual([b for b in out["blockers"] if b["type"] == "hard"], [])
+
+
+
+MANDATORY_PROFESSIONAL_SWEDISH = (
+    "You will build an AI-assisted workflow product end to end. Professional English is required. "
+    "Fluent Swedish is required because you will independently run weekly customer sessions in Swedish."
+)
+SWEDISH_AD_NO_REQUIREMENT = (
+    "Vi bygger en AI-baserad produkt och söker en utvecklare som arbetar från behovsanalys till "
+    "produktion. Du arbetar med React, TypeScript, Python och PostgreSQL i ett litet produktteam."
+)
+
+
+class LanguageLevelTests(unittest.TestCase):
+    """The proficiency scale itself: parsing, ordering and unknown handling."""
+
+    def test_cefr_tokens_parse_in_any_case_and_context(self):
+        for raw, expected in [
+            ("A2", "A2"), ("a2, progressing", "A2"), ("B1 (intermediate)", "B1"),
+            ("Swedish: c1", "C1"), ("c2", "C2"), ("A1", "A1"),
+        ]:
+            self.assertEqual(cs.normalize_language_level(raw).label, expected, raw)
+
+    def test_prose_aliases_map_onto_the_scale(self):
+        for raw, rank_of in [
+            ("fluent", "C1"), ("Flytande", "C1"), ("native speaker", "C2"),
+            ("Native", "C2"), ("advanced", "C1"), ("professional working proficiency", "C1"),
+            ("upper intermediate", "B2"), ("intermediate", "B1"),
+            ("beginner", "A1"), ("none", "none"),
+        ]:
+            level = cs.normalize_language_level(raw)
+            self.assertEqual(level.rank, cs.CEFR_SCALE.index(rank_of), raw)
+
+    def test_an_explicit_cefr_token_beats_a_prose_alias(self):
+        # "working towards fluent" must not be read as already fluent.
+        self.assertEqual(cs.normalize_language_level("A2, working towards fluent").label, "A2")
+
+    def test_missing_or_unrecognised_values_stay_unknown(self):
+        for raw in ["", None, "unknown", "not specified", "n/a", 42, [], "qwerty level"]:
+            level = cs.normalize_language_level(raw)
+            self.assertFalse(level.known, repr(raw))
+            self.assertIsNone(level.rank, repr(raw))
+
+    def test_unknown_never_satisfies_and_is_not_treated_as_none(self):
+        unknown = cs.normalize_language_level("")
+        self.assertFalse(unknown.at_least("none"))
+        self.assertFalse(unknown.at_least(cs.PROFESSIONAL_LANGUAGE_LEVEL))
+        self.assertNotEqual(unknown, cs.normalize_language_level("none"))
+
+    def test_scale_is_ordered(self):
+        ranks = [cs.normalize_language_level(x).rank for x in cs.CEFR_SCALE]
+        self.assertEqual(ranks, sorted(ranks))
+        self.assertTrue(cs.normalize_language_level("C1").at_least("B2"))
+        self.assertFalse(cs.normalize_language_level("B2").at_least("C1"))
+
+    def test_level_is_read_from_the_matcher_profile_constraints(self):
+        self.assertEqual(
+            cs.candidate_language_level({"constraints": {"swedish": "B2"}}, "swedish").label, "B2"
+        )
+        self.assertEqual(
+            cs.candidate_language_level({"languages": {"swedish": "fluent"}}, "swedish").label, "fluent"
+        )
+        self.assertFalse(cs.candidate_language_level({}, "swedish").known)
+        self.assertFalse(cs.candidate_language_level({"constraints": {}}, "swedish").known)
+
+    def test_the_shipped_profile_resolves_to_the_level_it_declares(self):
+        """Production semantics are unchanged: the level comes from the profile."""
+        path = MODULE_PATH.parent / "profile" / "matcher_profile.json"
+        if not path.exists():                       # a public checkout ships the example only
+            path = path.with_name("matcher_profile.example.json")
+        profile = json.loads(path.read_text(encoding="utf-8"))
+        declared = profile["constraints"]["swedish"]
+        level = cs.candidate_language_level(profile, "swedish")
+        self.assertTrue(level.known, declared)
+        self.assertEqual(level, cs.normalize_language_level(declared))
+
+
+class MandatoryLanguagePolicyTests(unittest.TestCase):
+    """Policy outcome as a function of the configured level, not of the code."""
+
+    BASE = dict(SwedishLanguagePolicyTests.BASE)
+
+    def policy(self, description, level):
+        return cs.normalize_evaluation_policy(
+            dict(self.BASE), {"description": description},
+            swedish=cs.normalize_language_level(level),
+        )
+
+    def swedish_rows(self, out):
+        return [r for r in out["must_have_assessment"]
+                if "swedish" in r["requirement"].casefold()]
+
+    def test_a2_against_mandatory_professional_swedish_is_unmet_and_hard(self):
+        out = self.policy(MANDATORY_PROFESSIONAL_SWEDISH, "A2")
+        self.assertEqual([r["status"] for r in self.swedish_rows(out)], ["unmet"])
+        self.assertTrue(any(b["type"] == "hard" for b in out["blockers"]))
+        self.assertLessEqual(out["opportunity_score"], 49)
+        self.assertEqual(
+            cs.classify_decision(out["career_fit"], out["opportunity_score"], out["blockers"]),
+            "store_no_notify",
+        )
+
+    def test_c1_is_sufficient_for_mandatory_professional_swedish(self):
+        out = self.policy(MANDATORY_PROFESSIONAL_SWEDISH, "C1")
+        self.assertEqual([r["status"] for r in self.swedish_rows(out)], ["met"])
+        self.assertEqual([b for b in out["blockers"] if b["type"] == "hard"], [])
+        self.assertEqual(out["opportunity_score"], self.BASE["opportunity_score"])
+        self.assertEqual(
+            cs.classify_decision(out["career_fit"], out["opportunity_score"], out["blockers"]),
+            "notify_strong",
+        )
+
+    def test_c2_fluent_and_native_are_all_sufficient(self):
+        for level in ["C2", "fluent", "native", "native speaker", "flytande"]:
+            out = self.policy(MANDATORY_PROFESSIONAL_SWEDISH, level)
+            self.assertEqual([r["status"] for r in self.swedish_rows(out)], ["met"], level)
+            self.assertEqual([b for b in out["blockers"] if b["type"] == "hard"], [], level)
+
+    def test_b2_is_a_documented_middle_ground_penalised_not_hard_blocked(self):
+        out = self.policy(MANDATORY_PROFESSIONAL_SWEDISH, "B2")
+        self.assertEqual([r["status"] for r in self.swedish_rows(out)], ["partial"])
+        self.assertEqual([b for b in out["blockers"] if b["type"] == "hard"], [])
+        self.assertTrue(any(b["type"] == "strong" for b in out["blockers"]))
+        self.assertLessEqual(out["opportunity_score"], 69)
+
+    def test_b1_and_below_are_hard_blocked(self):
+        for level in ["B1", "A1", "none"]:
+            out = self.policy(MANDATORY_PROFESSIONAL_SWEDISH, level)
+            self.assertEqual([r["status"] for r in self.swedish_rows(out)], ["unmet"], level)
+            self.assertTrue(any(b["type"] == "hard" for b in out["blockers"]), level)
+
+    def test_unknown_level_stays_unknown_and_is_never_fabricated_as_unmet(self):
+        for level in ["", "unknown", None, "not specified"]:
+            out = self.policy(MANDATORY_PROFESSIONAL_SWEDISH, level)
+            statuses = [r["status"] for r in self.swedish_rows(out)]
+            self.assertEqual(statuses, ["unknown"], repr(level))
+            self.assertEqual([b for b in out["blockers"] if b["type"] == "hard"], [], repr(level))
+            self.assertEqual(out["opportunity_score"], self.BASE["opportunity_score"], repr(level))
+
+    def test_optional_swedish_never_blocks_at_any_level(self):
+        description = (
+            "Hands-on development and professional English are required. "
+            "Swedish is meriterande and considered a plus, but it is not mandatory."
+        )
+        for level in ["A1", "A2", "B2", "C2", "", "native"]:
+            out = self.policy(description, level)
+            self.assertEqual([b for b in out["blockers"] if b["type"] == "hard"], [], level)
+            self.assertEqual(self.swedish_rows(out), [], level)
+
+    def test_a_swedish_language_ad_alone_infers_no_requirement(self):
+        for level in ["A2", "C1", ""]:
+            out = self.policy(SWEDISH_AD_NO_REQUIREMENT, level)
+            self.assertEqual(self.swedish_rows(out), [], level)
+            self.assertEqual([b for b in out["blockers"] if b["type"] == "hard"], [], level)
+
+    def test_negation_vetoes_mandatory_detection_at_every_level(self):
+        for level in ["A1", "A2", "C1", ""]:
+            out = self.policy(SWEDISH_NOT_REQUIRED, level)
+            self.assertNotIn("mandatory_swedish_enforced", out["_policy_changes"], level)
+            self.assertEqual([b for b in out["blockers"] if b["type"] == "hard"], [], level)
+
+    def test_tal_och_skrift_wording_is_still_mandatory_detection(self):
+        out = self.policy(SWEDISH_MANDATORY_REVERSED, "A2")
+        self.assertIn("mandatory_swedish_enforced", out["_policy_changes"])
+        self.assertTrue(any(b["type"] == "hard" for b in out["blockers"]))
+
+    def test_explanations_quote_the_configured_level_and_no_other(self):
+        """Reasons are generated from the configured level, not from a literal."""
+        for level in ["A2", "C1", "B2"]:
+            out = self.policy(MANDATORY_PROFESSIONAL_SWEDISH, level)
+            blob = json.dumps(out, ensure_ascii=False)
+            self.assertIn(level, blob, level)
+            for other in {"A2", "C1", "B2"} - {level}:
+                self.assertNotIn(other, blob, "%s leaked %s" % (level, other))
+
+
+class SystemPromptLanguageTests(unittest.TestCase):
+    """The prompt describes the configured level and never assumes one."""
+
+    def test_prompt_states_the_configured_level(self):
+        for level in ["A2", "B2", "C1", "C2"]:
+            prompt = cs.semantic_system_prompt(cs.normalize_language_level(level))
+            self.assertIn("Candidate Swedish is %s" % level, prompt)
+
+    def test_prompt_says_unknown_rather_than_inventing_a_level(self):
+        prompt = cs.semantic_system_prompt(cs.UNKNOWN_LANGUAGE_LEVEL)
+        self.assertIn("not specified", prompt)
+        self.assertIn("UNKNOWN", prompt)
+        for level in cs.CEFR_SCALE[1:]:
+            self.assertNotIn("Candidate Swedish is %s" % level, prompt)
+
+    def test_default_prompt_carries_no_candidate_level(self):
+        prompt = cs.semantic_system_prompt()
+        for level in cs.CEFR_SCALE[1:]:
+            self.assertNotIn("Candidate Swedish is %s" % level, prompt)
+
+    def test_engine_source_contains_no_candidate_specific_level(self):
+        """Guard against the hardcoding regressing into the engine."""
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        for phrase in ["level is A2", "unmet at A2", "above A2", "Swedish is A2 and progressing"]:
+            self.assertNotIn(phrase, source, phrase)
 
 
 class RunSummaryTests(unittest.TestCase):
@@ -1049,6 +1261,267 @@ class NotificationHeaderTests(_PipelineHarness):
             out, _ = self.drive(settings, scores=scores)
             self.assertNotIn("1 new match", out)
             self.assertTrue(out.lstrip().startswith("\U0001f7e2"), out[:80])
+
+class FreshCloneInstallTests(unittest.TestCase):
+    """install.sh must work from a checkout that ships only *.example files.
+
+    The suite runs on Linux and macOS. On a filesystem that cannot chmod, the
+    permission assertions are skipped rather than reported as failures; the
+    install logic itself is still exercised.
+    """
+
+    REPO = MODULE_PATH.parent
+    SCRIPT = MODULE_PATH.parent / "install.sh"
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("bash") is None:
+            raise unittest.SkipTest("bash is not available")
+        if not cls.SCRIPT.exists():
+            raise unittest.SkipTest("install.sh is not in this checkout")
+
+    @staticmethod
+    def chmod_is_meaningful(directory):
+        probe = Path(directory) / ".chmod_probe"
+        probe.write_text("x", encoding="utf-8")
+        try:
+            probe.chmod(0o600)
+            return (probe.stat().st_mode & 0o777) == 0o600
+        except OSError:
+            return False
+        finally:
+            probe.unlink(missing_ok=True)
+
+    def fresh_checkout(self, root):
+        """A checkout carrying only what a public clone ships."""
+        src = Path(root) / "checkout"
+        (src / "profile").mkdir(parents=True)
+        shutil.copy2(self.SCRIPT, src / "install.sh")
+        shutil.copy2(MODULE_PATH, src / MODULE_PATH.name)
+
+        def place(name, *candidates):
+            for candidate in candidates:
+                origin = self.REPO / candidate
+                if origin.exists():
+                    shutil.copy2(origin, src / name)
+                    return
+            self.fail("no source for %s" % name)
+
+        place("config.example.json", "config.example.json", "config.json")
+        place("secrets.env.example", "secrets.env.example")
+        place("profile/matcher_rules_v1_1.json", "profile/matcher_rules_v1_1.json")
+        for stem in ("career_profile", "matcher_profile", "search_lenses"):
+            place("profile/%s.example.json" % stem,
+                  "profile/%s.example.json" % stem,
+                  "public/profile/%s.example.json" % stem,
+                  "profile/%s.json" % stem)
+        return src
+
+    def run_install(self, src, home, scripts, *args):
+        env = dict(os.environ)
+        env["ROLELENS_HOME"] = str(home)
+        env["ROLELENS_SCRIPTS_HOME"] = str(scripts)
+        return subprocess.run(
+            ["bash", str(src / "install.sh"), *args],
+            capture_output=True, text=True, env=env, cwd=str(src),
+        )
+
+    def test_fresh_clone_installs_from_examples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.fresh_checkout(tmp)
+            home = Path(tmp) / "home"
+            result = self.run_install(src, home, Path(tmp) / "scripts")
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            for rel in ("config.json", "secrets.env",
+                        "profile/career_profile.json", "profile/matcher_profile.json",
+                        "profile/search_lenses.json", "profile/matcher_rules_v1_1.json"):
+                self.assertTrue((home / rel).is_file(), rel)
+            self.assertIn("Created", result.stdout)
+            self.assertIn("config.json", result.stdout)
+
+    def test_installed_files_are_valid_json_the_app_can_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.fresh_checkout(tmp)
+            home = Path(tmp) / "home"
+            self.run_install(src, home, Path(tmp) / "scripts")
+            for rel in ("config.json", "profile/matcher_profile.json",
+                        "profile/matcher_rules_v1_1.json"):
+                json.loads((home / rel).read_text(encoding="utf-8"))
+            settings = cs.Settings.load(home)
+            self.assertEqual(settings.primary_provider, cs.PRIMARY_PROVIDER)
+
+    def test_rerunning_does_not_overwrite_user_edits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.fresh_checkout(tmp)
+            home = Path(tmp) / "home"
+            scripts = Path(tmp) / "scripts"
+            self.run_install(src, home, scripts)
+
+            edited = json.loads((home / "config.json").read_text(encoding="utf-8"))
+            edited["search_terms"] = ["my own term"]
+            (home / "config.json").write_text(json.dumps(edited), encoding="utf-8")
+            (home / "secrets.env").write_text("VERTEX_GEMINI_API_KEY=mine\n", encoding="utf-8")
+            profile = home / "profile" / "matcher_profile.json"
+            mine = json.loads(profile.read_text(encoding="utf-8"))
+            mine["constraints"]["swedish"] = "C1"
+            profile.write_text(json.dumps(mine), encoding="utf-8")
+
+            result = self.run_install(src, home, scripts)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads((home / "config.json").read_text(encoding="utf-8"))["search_terms"],
+                ["my own term"],
+            )
+            self.assertEqual((home / "secrets.env").read_text(encoding="utf-8"),
+                             "VERTEX_GEMINI_API_KEY=mine\n")
+            self.assertEqual(
+                json.loads(profile.read_text(encoding="utf-8"))["constraints"]["swedish"], "C1"
+            )
+            self.assertIn("Kept your existing files", result.stdout)
+
+    def test_refresh_config_overwrites_config_but_never_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.fresh_checkout(tmp)
+            home = Path(tmp) / "home"
+            scripts = Path(tmp) / "scripts"
+            self.run_install(src, home, scripts)
+            (home / "config.json").write_text('{"broken": true}', encoding="utf-8")
+            (home / "secrets.env").write_text("VERTEX_GEMINI_API_KEY=mine\n", encoding="utf-8")
+
+            result = self.run_install(src, home, scripts, "--refresh-config")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("search_terms",
+                          json.loads((home / "config.json").read_text(encoding="utf-8")))
+            self.assertEqual((home / "secrets.env").read_text(encoding="utf-8"),
+                             "VERTEX_GEMINI_API_KEY=mine\n")
+
+    def test_missing_template_fails_loudly_and_creates_nothing_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.fresh_checkout(tmp)
+            (src / "config.example.json").unlink()
+            home = Path(tmp) / "home"
+            result = self.run_install(src, home, Path(tmp) / "scripts")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot install config.json", result.stderr)
+            self.assertFalse((home / "config.json").exists())
+
+    def test_secrets_permissions_are_restrictive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            if not self.chmod_is_meaningful(tmp):
+                self.skipTest("filesystem does not honour chmod")
+            src = self.fresh_checkout(tmp)
+            home = Path(tmp) / "home"
+            self.run_install(src, home, Path(tmp) / "scripts")
+            self.assertEqual((home / "secrets.env").stat().st_mode & 0o777, 0o600)
+            self.assertEqual((home / "config.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+
+    def test_unknown_argument_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self.fresh_checkout(tmp)
+            result = self.run_install(src, Path(tmp) / "home", Path(tmp) / "scripts", "--wat")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("unknown argument", result.stderr)
+
+
+class DoctorOnboardingTests(unittest.TestCase):
+    """doctor distinguishes missing / template / no-credentials / ready."""
+
+    REPO = MODULE_PATH.parent
+
+    def build(self, tmp, *, credentials=True, personalise=False):
+        home = Path(tmp)
+        (home / "profile").mkdir(parents=True, exist_ok=True)
+        (home / "data").mkdir(parents=True, exist_ok=True)
+
+        def pick(*candidates):
+            for candidate in candidates:
+                path = self.REPO / candidate
+                if path.exists():
+                    return path
+            self.fail("no source for %s" % (candidates,))
+
+        shutil.copy2(pick("config.example.json", "config.json"), home / "config.json")
+        shutil.copy2(pick("profile/matcher_rules_v1_1.json"),
+                     home / "profile" / "matcher_rules_v1_1.json")
+        for stem in ("career_profile", "matcher_profile", "search_lenses"):
+            shutil.copy2(
+                pick("public/profile/%s.example.json" % stem,
+                     "profile/%s.example.json" % stem),
+                home / "profile" / ("%s.json" % stem),
+            )
+        if personalise:
+            for stem in ("career_profile", "matcher_profile", "search_lenses"):
+                path = home / "profile" / ("%s.json" % stem)
+                data = json.loads(path.read_text(encoding="utf-8"))
+                data.pop("profile_status", None)
+                blob = json.dumps(data, ensure_ascii=False)
+                for marker in cs.TEMPLATE_MARKERS:
+                    blob = blob.replace(marker.replace('\\"', '"'), "personalised")
+                path.write_text(blob, encoding="utf-8")
+        secrets = (
+            "VERTEX_GEMINI_API_KEY=k\nVERTEX_GEMINI_MODEL=gemini-3.7-flash\n"
+            "AZURE_OPENAI_API_KEY=k\nAZURE_OPENAI_BASE_URL=https://example.invalid\n"
+            "AZURE_OPENAI_DEPLOYMENT=d\n"
+        ) if credentials else "VERTEX_GEMINI_MODEL=gemini-3.7-flash\n"
+        (home / "secrets.env").write_text(secrets, encoding="utf-8")
+        return cs.Settings.load(home)
+
+    def test_missing_profile_file_names_the_installer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build(tmp)
+            (Path(tmp) / "profile" / "matcher_profile.json").unlink()
+            with self.assertRaises(cs.ConfigurationError) as caught:
+                cs.doctor(settings, require_key=False)
+            self.assertIn("install.sh", str(caught.exception))
+
+    def test_unedited_templates_are_reported_not_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = cs.doctor(self.build(tmp), require_key=True)
+            self.assertTrue(info["unedited_example_profiles"])
+            self.assertFalse(info["ready"])
+            self.assertTrue(any("Personalise" in step for step in info["next_steps"]))
+
+    def test_missing_credentials_are_reported_with_the_template_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build(tmp, credentials=False)
+            with self.assertRaises(cs.ConfigurationError) as caught:
+                cs.doctor(settings, require_key=True)
+            message = str(caught.exception)
+            self.assertIn("VERTEX_GEMINI_API_KEY", message)
+            self.assertIn("still unedited", message)
+            info = cs.doctor(settings, require_key=False)
+            self.assertIn("VERTEX_GEMINI_API_KEY", info["missing_credentials"])
+            self.assertFalse(info["ready"])
+
+    def test_a_personalised_installation_reports_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info = cs.doctor(self.build(tmp, personalise=True), require_key=True)
+            self.assertEqual(info["unedited_example_profiles"], [])
+            self.assertEqual(info["missing_credentials"], [])
+            self.assertTrue(info["ready"])
+            self.assertEqual(info["next_steps"], [])
+
+    def test_doctor_surfaces_the_configured_language_level(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build(tmp)
+            profile = Path(tmp) / "profile" / "matcher_profile.json"
+            data = json.loads(profile.read_text(encoding="utf-8"))
+            data["constraints"]["swedish"] = "C1"
+            profile.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            self.assertEqual(cs.doctor(settings, require_key=True)["candidate_swedish_level"], "C1")
+
+    def test_an_unspecified_language_level_is_called_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self.build(tmp)
+            profile = Path(tmp) / "profile" / "matcher_profile.json"
+            data = json.loads(profile.read_text(encoding="utf-8"))
+            data["constraints"].pop("swedish", None)
+            profile.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            info = cs.doctor(settings, require_key=True)
+            self.assertEqual(info["candidate_swedish_level"], "unknown")
+            self.assertTrue(any("constraints.swedish" in step for step in info["next_steps"]))
 
 if __name__ == "__main__":
     unittest.main()
