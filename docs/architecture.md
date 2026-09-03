@@ -238,7 +238,7 @@ if index and time.monotonic() + reserve_seconds > deadline:
 
 ```mermaid
 flowchart LR
-    B[Batch] --> P[Gemini 3.7 Flash<br/>primary]
+    B[Batch] --> P[Gemini 3.8 Flash<br/>primary]
     P -- HTTP 200 --> V[Validate]
     P -- transport / timeout / 429 /<br/>unavailable / temporary 5xx --> F[Azure GPT-5 mini<br/>one call only]
     F -- HTTP 200 --> V

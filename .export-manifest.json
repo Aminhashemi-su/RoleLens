@@ -3,15 +3,15 @@
   "files": {
     ".gitattributes": "c58df123f9e3845acb0884cc825062262116a6c71cf3b6262fd89494b4fbc0cc",
     ".gitignore": "77270005976213f6ff4b11856d0f254235e17dc2ab36a39ae9ab93e5286e2f33",
-    "CHANGELOG.md": "e4f0f7837870d4540d0adf7675f146a2ebc5f670fc6eda434838938d1126ea5c",
+    "CHANGELOG.md": "393c6ce39bd1a8a63404674d0a17fb15a92df77b3a62ecd0021a805de5d5de09",
     "LICENSE": "68fc5809c29a01a976a637abd2a4af5347eb7e8c2389abdcbe04b7e2ff8cf833",
-    "README.md": "8d2da48b1140b2b005fde41357a92d07743aa93b831662619366d41d6e5b9efb",
+    "README.md": "8991e7520c41dae50c363b3342eab822850a879e8566332bb6435876e339dbe5",
     "benchmark/README.md": "a9440b0acc114c06eb49dd4be4989099aa3f43f2b755c351751ed0375a28c2c9",
     "benchmark/benchmark_runner.py": "5813a7669b9bf9c2b964edea473f1cdcff18e7d4d01e8a19ab3d9107069be977",
     "benchmark/example_results.json": "29c0557b8196e7baba0436534d0fe86744d8bccf39f76426ba6cef5829a8b2a0",
     "benchmark/sample_cases.json": "c9108719c88d2cb3cb927fe5d4885613e4a0d1bd3f213fc58b34956229f6a253",
     "config.example.json": "6661c79ae1a7dbff331fdcf1eb2fca6ca6f1e293b4a2c86e2f4c85876b63bf13",
-    "docs/architecture.md": "2281acc8e876e59112c46878a266890fe1661a69da56ad768a53e4824639d5f5",
+    "docs/architecture.md": "7f2877bdac24a2046d5dad688d3a5bb43449a12bec5444cd622bf9454471a01d",
     "docs/case-study.md": "931738057054debd52d0d2ab0538a83b19eb6dbd4e8824ba0f830cb3f524f748",
     "docs/operations.md": "16b1663f2e8eaf428d11be6180d269c6e549febbe65c634f85e466e093527d12",
     "docs/provider-benchmark.md": "c15c14598506743f6004af93d51545a847ec924ed47b8ac574e55a8ed7dbcd80",
@@ -20,9 +20,9 @@
     "profile/matcher_profile.example.json": "975e665bd4218db2b4fc53351c022381c2ce56d4d26b03d54f6dc0ba9ade8265",
     "profile/matcher_rules_v1_1.json": "fa5afafd7d2b29c8267f395b3c2bc56977979ddd370d449372ac3405c0af7577",
     "profile/search_lenses.example.json": "a6e48eaeac898a2022690b77df897d64f1856d95abdec3920e200eb0aafa418c",
-    "rolelens.py": "4c2b6630c04945ad5079150964faf117e8000caf518b4b96c0e05445d8ae4b32",
-    "secrets.env.example": "7e84d00a535729dea82ae685f2f2e1279582d0fcc39c78c0b470854091ba05c2",
-    "tests/test_rolelens.py": "c408016968550e6fc6e2a659dca77560b53f3c0185a984903bdb71e9582317e7",
-    "tools/check_public_safety.py": "811d2cc3b9946883f051e00b72f6c2dde31989ee56544d01862dd06d482f3df1"
+    "rolelens.py": "d56d6ba1707e379fa51b36caaaf639d43bbff51e2dd2e853942f6f7461ec7ace",
+    "secrets.env.example": "b62c7d58d0037fbe45432a99c0a5651048384202256fa27b9128eaf987681d40",
+    "tests/test_rolelens.py": "f2bd67dcc157dace6c76f05150e52681592fd23ee67b9e1aac982383ff9573d1",
+    "tools/check_public_safety.py": "50d70283b55ff1d4f7b44b1677e0c495c79ba3a26ad8c18af8ab4a10ebdac09f"
   }
 }

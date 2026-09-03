@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 APP_NAME = "rolelens"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.9.0"
 SCHEMA_VERSION = "2"
 DEFAULT_HOME = Path.home() / ".rolelens"
 JOBSEARCH_BASE_URL = "https://jobsearch.api.jobtechdev.se"
@@ -1025,6 +1025,14 @@ class Database:
                 LEFT JOIN notifications n ON n.evaluation_id=e.id
                 WHERE n.evaluation_id IS NULL
                   AND e.decision IN ('notify_strong','notify_good','notify_stretch','notify_verify')
+                  -- One vacancy, one alert. Notifications key on the evaluation, so a
+                  -- re-evaluation (a new profile version, an edited ad) mints a fresh id
+                  -- and would deliver a job the candidate has already read.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM notifications prior
+                      JOIN evaluations e2 ON e2.id = prior.evaluation_id
+                      WHERE e2.job_id = j.id
+                  )
                   {scope_clause}
                 ORDER BY e.opportunity_score DESC, e.career_fit DESC, e.evaluated_at ASC
                 LIMIT ?
@@ -1148,20 +1156,71 @@ def swedish_prompt_clause(level: LanguageLevel) -> str:
     )
 
 
-def semantic_system_prompt(swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL) -> str:
+def citizenship_prompt_clause(profile: Mapping[str, Any] | None) -> str:
+    """Describe the configured eligibility position, and what follows from it.
+
+    Silence means UNKNOWN, which the engine preserves rather than guessing. The
+    distinction that decides the outcome is between a nationality requirement,
+    which no permit can satisfy, and a right-to-work requirement, which a permit
+    already held does satisfy. Swedish advertisements word the two almost
+    identically and often in the same sentence.
+    """
+    constraints = profile.get("constraints") if isinstance(profile, Mapping) else None
+    if not isinstance(constraints, Mapping):
+        return ""
+    read = lambda key: clean_text(constraints.get(key)).casefold()
+    if read("swedish_citizenship") not in {"yes", "no"}:
+        return ""
+    if read("swedish_citizenship") == "yes":
+        return "The candidate is a Swedish citizen, so nationality requirements are met. "
+
+    barred = ["Swedish citizenship"]
+    if read("eu_citizenship") == "no":
+        barred.append("EU/EEA citizenship")
+    if read("permanent_residence") == "no":
+        barred.append("a permanent residence permit")
+    clause = (
+        "The candidate does not hold, and cannot obtain in time, " + ", ".join(barred[:-1])
+        + (" or " if len(barred) > 1 else "") + barred[-1] + ". "
+        "Where an advertisement makes any of those mandatory - including a Swedish security classification "
+        "that requires citizenship - the requirement is unmet: record it as a hard blocker with the reason "
+        "naming which one, not as unknown. "
+    )
+    if read("work_permit") == "yes":
+        clause += (
+            "The candidate does hold a long-term visa with a valid work permit and needs no employer "
+            "sponsorship and no relocation package. So a requirement phrased as the right to work, existing "
+            "work authorisation, a valid work permit, or an inability of the employer to sponsor a visa is "
+            "MET and is never a blocker, even when the same sentence also mentions citizenship. Read which "
+            "of the two the advertisement actually requires before deciding. "
+        )
+    return clause
+
+
+def semantic_system_prompt(
+    swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL,
+    profile: Mapping[str, Any] | None = None,
+) -> str:
     return (
         "You are an evidence-disciplined semantic career matcher for Swedish job discovery. "
         "Evaluate what the person would actually do, not the advertised title. Understand English and Swedish. "
         "Use only candidate evidence supplied below; never invent experience or turn unknown facts into unmet facts. "
         "Score career_fit only for long-term role/content alignment. Practical constraints such as language, location, "
         "citizenship, clearance, or timing belong in opportunity_score and blockers, never career_fit. "
-        + swedish_prompt_clause(swedish) +
+        + swedish_prompt_clause(swedish) + citizenship_prompt_clause(profile) +
         "A Swedish-language advertisement alone is not a Swedish-language requirement. "
         "Judge explicit mandatory fluent/professional/advanced Swedish against the candidate level stated above; preferred or optional "
         "Swedish is never a blocker. Ordinary background/security screening does not imply citizenship or clearance eligibility. "
         "If citizenship or security eligibility is explicitly required and candidate evidence does not resolve it, preserve UNKNOWN. "
         "Unknown years of experience are unknown or partial, not automatically unmet. Founder/CTO titles are not proof of "
-        "staff-level seniority. Return exactly one evaluation for every supplied source_job_id, no duplicates and no other IDs. "
+        "staff-level seniority. "
+        "Record a hard blocker when the centre of the job is work the candidate has no evidence for: a named primary "
+        "language or framework the role is built on, a specialist engineering discipline such as vision, hardware or "
+        "embedded systems, a named enterprise platform, or a function that is not software engineering at all such as "
+        "delivery coordination or project management. Judge what the person would spend most of their week doing, not "
+        "the length of the requirements list. A peripheral tool, a listed nice-to-have, or something a strong engineer "
+        "picks up on the job is never a hard blocker. "
+        "Return exactly one evaluation for every supplied source_job_id, no duplicates and no other IDs. "
         "Keep explanations concise. The application derives the final notification decision deterministically."
     )
 
@@ -1290,6 +1349,7 @@ def parse_provider_evaluations(
     model: str,
     usage: dict[str, int],
     swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL,
+    eligibility: Mapping[str, str] | None = None,
 ) -> ProviderBatchResult:
     expected = {str(row["source_job_id"]): row for row in jobs}
     expected_ids = set(expected)
@@ -1330,7 +1390,8 @@ def parse_provider_evaluations(
         if item_id in duplicates:
             continue
         try:
-            accepted[item_id] = validate_evaluation(item, job=expected[item_id], swedish=swedish)
+            accepted[item_id] = validate_evaluation(
+                item, job=expected[item_id], swedish=swedish, eligibility=eligibility)
         except RemoteAPIError as exc:
             errors.append(f"{item_id}: {compact_sentence(exc, 140)}")
     if unknown_ids:
@@ -1369,6 +1430,8 @@ class ProviderMatcher:
         self.provider = provider
         # Candidate proficiency is configuration; the engine never assumes a level.
         self.swedish = candidate_language_level(matcher_profile, "swedish")
+        # Likewise eligibility: unstated stays UNKNOWN, stated is allowed to decide.
+        self.eligibility = candidate_eligibility(matcher_profile)
         if provider == PRIMARY_PROVIDER:
             self.model = secrets.get("VERTEX_GEMINI_MODEL", "")
             self.api_key = secrets.get("VERTEX_GEMINI_API_KEY", "")
@@ -1392,7 +1455,7 @@ class ProviderMatcher:
             return ProviderBatchResult(self.provider, self.model, (), expected_ids, empty_usage())
         payload_jobs = [row_to_model_job(row, self.settings.max_job_description_chars) for row in jobs]
         user_payload = {"candidate": self.matcher_profile, "matching_rules": self.matcher_rules, "jobs": payload_jobs}
-        system_prompt = semantic_system_prompt(self.swedish)
+        system_prompt = semantic_system_prompt(self.swedish, self.matcher_profile)
         if self.provider == PRIMARY_PROVIDER:
             request_payload = {
                 "systemInstruction": {"parts": [{"text": system_prompt}]},
@@ -1439,7 +1502,8 @@ class ProviderMatcher:
                                        compact_sentence(exc, 500), "output")
 
         result = parse_provider_evaluations(
-            content, jobs, provider=self.provider, model=self.model, usage=usage, swedish=self.swedish
+            content, jobs, provider=self.provider, model=self.model, usage=usage,
+            swedish=self.swedish, eligibility=self.eligibility
         )
         archive_model_response(self.settings, self.provider, content, failure=bool(result.error))
         return result
@@ -2125,6 +2189,11 @@ CLEARANCE_ELIGIBILITY_PATTERN = re.compile(
     r"\bsäkerhetsklarering\s+(?:krävs|är ett krav)\b",
     re.IGNORECASE,
 )
+CITIZENSHIP_ALTERNATIVE_PATTERN = re.compile(
+    r"\bwork\s+permits?\b|\bright\s+to\s+work\b|\bwork\s+authoris?z?ations?\b|"
+    r"\barbetstillstånd\w*|\buppehållstillstånd\w*|\bpermission\s+to\s+work\b",
+    re.IGNORECASE,
+)
 SCREENING_PATTERN = re.compile(
     r"\bbackground (?:check|screening)\b|\bsecurity screening\b|\bsäkerhetsprövning\b",
     re.IGNORECASE,
@@ -2208,11 +2277,56 @@ def mandatory_language_outcome(level: LanguageLevel, language: str = "Swedish") 
     }
 
 
+def mentions_swedish_language(text: Any) -> bool:
+    """True for a Swedish *language* requirement, false for Swedish citizenship.
+
+    "Mandatory Swedish" and "Swedish citizenship" share a word and nothing else.
+    Matching on the word alone made the language normaliser delete citizenship
+    rows, which then could never become blockers.
+    """
+    return mentions(text, ("swedish", "svenska")) and not mentions(text, ("citizen", "medborg"))
+
+
+def candidate_eligibility(profile: Mapping[str, Any]) -> dict[str, str] | None:
+    """The candidate's nationality/residence position, or None when unstated.
+
+    None keeps the historical behaviour: an explicit citizenship demand is
+    preserved as UNKNOWN rather than guessed at.
+    """
+    if not isinstance(profile, Mapping):
+        return None
+    constraints = profile.get("constraints")
+    if not isinstance(constraints, Mapping):
+        return None
+    read = lambda key: clean_text(constraints.get(key)).casefold()
+    if read("swedish_citizenship") not in {"yes", "no"}:
+        return None
+    return {
+        "swedish_citizenship": read("swedish_citizenship"),
+        "eu_citizenship": read("eu_citizenship"),
+        "permanent_residence": read("permanent_residence"),
+        "work_permit": read("work_permit"),
+    }
+
+
+def barred_statuses(eligibility: Mapping[str, str] | None) -> list[str]:
+    """Which of the statuses an ad may demand the candidate cannot produce."""
+    if not eligibility or eligibility.get("swedish_citizenship") == "yes":
+        return []
+    barred = ["Swedish citizenship"]
+    if eligibility.get("eu_citizenship") == "no":
+        barred.append("EU/EEA citizenship")
+    if eligibility.get("permanent_residence") == "no":
+        barred.append("permanent residence")
+    return barred
+
+
 def normalize_evaluation_policy(
     item: Mapping[str, Any],
     job: Mapping[str, Any],
     *,
     swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL,
+    eligibility: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Apply narrow, auditable policy facts before deriving the decision."""
     normalized = dict(item)
@@ -2226,7 +2340,7 @@ def normalize_evaluation_policy(
     mandatory_swedish = matches_any(description, SWEDISH_MANDATORY_PATTERNS) and not negated_swedish
     if mandatory_swedish:
         outcome = mandatory_language_outcome(swedish)
-        swedish_rows = [x for x in must_haves if mentions(x.get("requirement"), ("swedish", "svenska"))]
+        swedish_rows = [x for x in must_haves if mentions_swedish_language(x.get("requirement"))]
         if swedish_rows:
             for row in swedish_rows:
                 row["status"] = outcome["status"]
@@ -2237,7 +2351,7 @@ def normalize_evaluation_policy(
                 "status": outcome["status"],
                 "reason": outcome["reason"],
             })
-        blockers = [x for x in blockers if not mentions(x.get("reason"), ("swedish", "svenska"))]
+        blockers = [x for x in blockers if not mentions_swedish_language(x.get("reason"))]
         if outcome["blocker"] is not None:
             blockers.append({"type": outcome["blocker"], "reason": outcome["reason"]})
         if outcome["cap"] is not None:
@@ -2248,8 +2362,8 @@ def normalize_evaluation_policy(
         changes.append(outcome["change"])
     else:
         # Being written in Swedish, or merely preferring Swedish, is not a must-have.
-        must_haves = [x for x in must_haves if not mentions(x.get("requirement"), ("swedish", "svenska"))]
-        blockers = [x for x in blockers if not mentions(x.get("reason"), ("swedish", "svenska"))]
+        must_haves = [x for x in must_haves if not mentions_swedish_language(x.get("requirement"))]
+        blockers = [x for x in blockers if not mentions_swedish_language(x.get("reason"))]
         if optional_swedish:
             normalized["language_risk"] = "Swedish is optional/preferred and is not a blocker."
             changes.append("optional_swedish_not_blocking")
@@ -2258,13 +2372,42 @@ def normalize_evaluation_policy(
     explicit_clearance = bool(CLEARANCE_ELIGIBILITY_PATTERN.search(description))
     screening_only = bool(SCREENING_PATTERN.search(description)) and not explicit_citizenship and not explicit_clearance
     sensitive_terms = ("citizen", "citizenship", "medborg", "clearance", "security eligibility")
-    if screening_only:
+    clearance_terms = ("clearance", "security eligibility")
+    # Citizenship is only forced to UNKNOWN while the profile does not answer it.
+    citizenship_unresolved = explicit_citizenship and eligibility is None
+    barred = barred_statuses(eligibility)
+    # A permit the candidate already holds satisfies a right-to-work demand, so the
+    # ad has to be asking for nationality itself before this can bite.
+    permit_route = bool(CITIZENSHIP_ALTERNATIVE_PATTERN.search(description))
+    citizenship_barred = explicit_citizenship and bool(barred) and not permit_route
+    if citizenship_barred:
+        # Whether the candidate holds a nationality is a fact the profile states,
+        # not a judgement, so the engine settles it instead of asking the model. A
+        # conditional demand ("citizenship may be required") still counts: it cannot
+        # be satisfied either, and leaving it as unknown just forwards the dead end.
+        reason = (
+            "Requires " + " or ".join(barred) + ", which the candidate does not hold, "
+            "and the ad offers no work-permit alternative."
+        )
+        must_haves = [x for x in must_haves if not mentions(x.get("requirement"), sensitive_terms)]
+        must_haves.append({
+            "requirement": "Citizenship or residence status",
+            "status": "unmet",
+            "reason": reason,
+        })
+        blockers = [x for x in blockers if not mentions(x.get("reason"), sensitive_terms)]
+        blockers.append({"type": "hard", "reason": reason})
+        changes.append("citizenship_barred")
+    elif screening_only:
         must_haves = [x for x in must_haves if not mentions(x.get("requirement"), sensitive_terms)]
         blockers = [x for x in blockers if not mentions(x.get("reason"), sensitive_terms)]
         changes.append("screening_not_converted_to_eligibility")
-    elif explicit_citizenship or explicit_clearance:
-        label = "Citizenship eligibility" if explicit_citizenship else "Security-clearance eligibility"
-        related = [x for x in must_haves if mentions(x.get("requirement"), sensitive_terms)]
+    elif citizenship_unresolved or explicit_clearance:
+        label = "Citizenship eligibility" if citizenship_unresolved else "Security-clearance eligibility"
+        # With citizenship answered, only clearance is rewritten, so the evaluator's
+        # own citizenship finding survives instead of being flattened to unknown.
+        terms = sensitive_terms if citizenship_unresolved else clearance_terms
+        related = [x for x in must_haves if mentions(x.get("requirement"), terms)]
         if related:
             for row in related:
                 row["status"] = "unknown"
@@ -2275,7 +2418,7 @@ def normalize_evaluation_policy(
                 "status": "unknown",
                 "reason": f"{label} is explicit in the ad but unresolved by candidate evidence.",
             })
-        blockers = [x for x in blockers if not mentions(x.get("reason"), sensitive_terms)]
+        blockers = [x for x in blockers if not mentions(x.get("reason"), terms)]
         blockers.append({"type": "unknown", "reason": f"{label} requires candidate verification."})
         changes.append("explicit_eligibility_preserved_unknown")
 
@@ -2329,9 +2472,11 @@ def validate_evaluation(
     *,
     job: Mapping[str, Any] | None = None,
     swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL,
+    eligibility: Mapping[str, str] | None = None,
 ) -> Evaluation:
     normalized = (
-        normalize_evaluation_policy(item, job, swedish=swedish) if job is not None else dict(item)
+        normalize_evaluation_policy(item, job, swedish=swedish, eligibility=eligibility)
+        if job is not None else dict(item)
     )
     item = normalized
     source_job_id = clean_text(item.get("source_job_id"))

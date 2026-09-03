@@ -144,7 +144,7 @@ ALLOW_MARKERS: tuple[str, ...] = (
 )
 
 # Version strings, schema versions and semver-like tuples are numerically valid
-# IPv4 addresses ("2.0.0.1"), so the IP rule needs context to stay useful.
+# IPv4 addresses ("2.0.0.1"), so the IP rule needs context to stay useful.  noqa: safety
 IP_VERSION_CONTEXT = re.compile(
     r"(?i)\b(?:version|versions|schema|semver|release|revision|build|tag|v\d)\b|"
     r"__version__|APP_VERSION|SCHEMA_VERSION|schema_version"

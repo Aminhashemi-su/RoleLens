@@ -3,10 +3,129 @@
 RoleLens was developed under an earlier internal name before this repository
 existed, so V1.1–V1.4 have no individual Git commits. This file records the
 known major versions instead. Version 1.5.1 is the first state captured in
-Git; 1.7.0 is the current release.
+Git; 1.9.0 is the current release.
 
 The format is loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project does not follow strict semantic versioning.
+
+## [1.9.0] — 2026-09-03
+
+Work eligibility became a fact the engine can be told, rather than a question it
+forwards to the candidate.
+
+### Added
+- **Four optional `constraints` fields in the matcher profile:**
+  `swedish_citizenship`, `eu_citizenship`, `permanent_residence`, `work_permit`.
+  While `swedish_citizenship` is absent the engine behaves exactly as before,
+  preserving an explicit citizenship demand as UNKNOWN — turning "we do not
+  know" into "you are rejected" silently loses real roles. Once the profile
+  answers it, the engine decides instead of asking.
+- `candidate_eligibility()` and `barred_statuses()`, which read that position,
+  and `CITIZENSHIP_ALTERNATIVE_PATTERN`, which recognises a right-to-work route.
+
+### Fixed
+- **A vacancy demanding a nationality the candidate cannot hold is now a hard
+  blocker, decided deterministically.** Asked to judge this itself, the evaluator
+  hedged: on roles whose advertisement says citizenship *may* be required rather
+  than *is*, it returned `notify_verify` rather than ruling them out. A
+  conditional nationality demand cannot be satisfied either, so forwarding it as
+  unknown just hands over a dead end. Whether someone holds a nationality is a
+  stated fact rather than a judgement, so the policy layer settles it.
+- **The right-to-work exception, which is the expensive half.** Advertisements
+  word "Swedish citizen or valid EU work permits" and "svenskt medborgarskap
+  krävs" almost identically and often in one sentence; only the second is a
+  bar. An advertisement offering a permit route is never blocked when the profile
+  says a permit is held. The pattern must match the plural — a real vacancy
+  said "work permits" and was wrongly barred until it did.
+- **The Swedish-language normaliser was deleting citizenship rows.** It matched
+  on the word "swedish" alone, so "Swedish citizenship" was filtered out as a
+  language requirement and could never become a blocker.
+  `mentions_swedish_language()` now separates the two.
+- **A vacancy is never delivered twice.** Notifications key on the evaluation, so
+  re-evaluating a job — a new profile version, an edited advertisement —
+  minted a fresh id and re-sent a vacancy already read. Any profile edit would
+  have re-delivered a batch of them.
+
+### Measured
+Six real vacancies through the live prompt and policy layer: 6/6 correct. Roles
+whose *content* fit is high but which demand an unattainable nationality are now
+blocked on eligibility alone; advertisements offering a permit route still pass.
+
+### Notes
+- Changing any profile field changes `profile_version`, which re-queues every
+  live job. An operator who does not want a re-scoring sweep can carry existing
+  evaluations forward to the new version, so the new rule governs what arrives
+  from then on without recomputing stored verdicts.
+- 161 tests, up from 153.
+
+## [1.8.0] — 2026-09-03
+
+One prompt clause, and no code change beyond it. The evaluator was rating jobs
+notifiable whose subject matter it had *already identified* as outside the
+candidate's evidence.
+
+### Fixed
+- **A job whose core work is outside candidate evidence is now a hard blocker.**
+  The failure was not comprehension. On an industrial inline-vision role the
+  evaluator named the position accurately as a vision and inspection system
+  ownership role, listed the specialist camera and calibration background as a
+  gap — and then scored it notifiable anyway, because that gap was one bullet
+  among three positives. The same shape appeared on a role built on a language
+  the candidate had never used, and on an information-management role that was
+  not software engineering at all. The prompt now asks for that judgement as a
+  `hard` blocker, which `classify_decision` has always suppressed. No schema,
+  database or policy change was needed.
+
+### Measured
+Four probe vacancies held constant while their batch neighbours varied, scored
+through the real policy layer:
+- The guard fired on every role that deserved it, and on **none** of ten stored
+  strong/good matches, so it does not cost real opportunities.
+- Decisions were correct in every probe evaluation across three identical runs.
+- On one probe the blocker itself fired in two of three runs, but the decision
+  was right regardless because the score also sat well below the threshold. A
+  dedicated boolean field was stable in all three and remains the upgrade path if
+  that flicker ever costs a decision; it was not shipped because it needs a
+  schema and a database column to buy an outcome this already achieves.
+
+### Notes — two findings that matter more than the fix
+- **The score is noisy; the judgement is not.** Re-running a byte-identical batch
+  moved individual scores by up to 20 points. Changing the batch neighbours moved
+  them no further. **There is no evidence of a batch-context effect** — an
+  earlier hypothesis that scores were "batch-context dependent" was never tested
+  and is withdrawn. It is ordinary sampling variance, concentrated on ambiguous
+  vacancies: clear ones returned identical scores run after run. Instability is
+  itself a signal of low confidence.
+- **Scores stored by the previous model read about 20 points high.** Rows written
+  before 1.7.1 are not comparable with later ones, and `backfill-report` will
+  surface matches today's evaluator would not raise.
+
+## [1.7.1] — 2026-09-03
+
+Primary evaluator moved from Gemini 3.7 Flash to **Gemini 3.8 Flash**. No code
+change was needed: 3.8 accepts the same `responseJsonSchema` and
+`thinkingConfig`, so this is a one-line `secrets.env` edit.
+
+### Changed
+- `VERTEX_GEMINI_MODEL` is now `gemini-3.8-flash` in the templates and in the
+  documents that describe the current system. Documents that record *past*
+  benchmarks (`docs/provider-benchmark.md`, `docs/case-study.md`, and the 1.5.x
+  entries below) still name 3.7, because that is what those benchmarks ran on.
+
+### Evidence
+- Frozen error-class benchmark: 3.8 scored 10/10 exact against expectations
+  written before either model saw the cases; 3.7 scored 9/10, over-rating
+  ordinary background screening as a strong match. No false negatives either way.
+- Ten known-strong vacancies: both models kept all ten above the notify
+  threshold.
+- Latency: 26.8-43.9 s per batch of ten on 3.8 against 50.0-68.1 s on 3.7.
+
+### Known open question
+Re-evaluating already-scored vacancies produced materially different scores on
+**both** models. Whether that is batch context (the evaluator scoring a job
+relative to its neighbours) or ordinary sampling variance is **not yet
+established**, and the two imply different fixes. Until it is measured, treat a
+stored score as a band rather than a number.
 
 ## [1.7.0] — 2026-09-01
 

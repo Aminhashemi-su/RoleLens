@@ -151,6 +151,49 @@ class RoleLensTests(unittest.TestCase):
         self.assertEqual(schema["type"], "object")
         self.assertIn("evaluations", schema["required"])
 
+    def test_a_vacancy_is_never_delivered_twice(self):
+        """Notifications key on the evaluation, so re-evaluating a job - a new
+        profile version, an edited ad - mints a fresh id. Without this the
+        candidate is sent a vacancy they have already read."""
+        with tempfile.TemporaryDirectory() as td:
+            db = cs.Database(Path(td) / "test.db")
+            try:
+                raw = {
+                    "id": "1",
+                    "headline": "AI Engineer",
+                    "description": {"text": "Build LLM applications."},
+                    "employer": {"name": "ACME"},
+                    "workplace_address": {"municipality": "Stockholm", "country": "Sverige"},
+                }
+                job = cs.normalize_job(raw)
+                job.matched_queries.add("ai engineer")
+                job.discovery_score = 10
+                db.upsert_job(job)
+
+                item = {
+                    "source_job_id": "1", "career_fit": 90, "opportunity_score": 90,
+                    "confidence": 0.9, "actual_role": "AI engineer",
+                    "why_fit": ["LLM work"], "candidate_evidence": ["RAG"],
+                    "must_have_assessment": [], "gaps": [], "blockers": [],
+                    "language_risk": "none", "seniority_risk": "low",
+                    "location_note": "preferred",
+                }
+                pending = db.pending_jobs("profile-v1", 10)
+                db.save_evaluation(pending[0], cs.validate_evaluation(item),
+                                   profile_version="profile-v1", model="test")
+                first = db.unnotified(10)
+                self.assertEqual(len(first), 1, "the first evaluation is delivered")
+                db.mark_notifications_emitted([first[0]["evaluation_id"]])
+
+                # Same job, same content, evaluated again under a new profile version.
+                pending = db.pending_jobs("profile-v2", 10)
+                self.assertEqual(len(pending), 1, "a new profile version re-queues the job")
+                db.save_evaluation(pending[0], cs.validate_evaluation(item),
+                                   profile_version="profile-v2", model="test")
+                self.assertEqual(db.unnotified(10), [], "but it is not delivered a second time")
+            finally:
+                db.close()
+
 
 
 SWEDISH_NOT_REQUIRED = 'Vi bygger en modern plattform i Stockholm. Teamets arbetsspråk är engelska och ansökan ska lämnas på engelska. Kunskaper i svenska krävs inte.'
@@ -502,6 +545,167 @@ class SystemPromptLanguageTests(unittest.TestCase):
         source = MODULE_PATH.read_text(encoding="utf-8")
         for phrase in ["level is A2", "unmet at A2", "above A2", "Swedish is A2 and progressing"]:
             self.assertNotIn(phrase, source, phrase)
+
+
+class CitizenshipResolutionTests(unittest.TestCase):
+    """An unstated citizenship stays UNKNOWN, because turning "we do not know"
+    into "you are rejected" silently loses real roles. Once the profile answers
+    it, the evaluator's own finding is allowed to stand."""
+
+    AD = "Krav på svenskt medborgarskap."
+    NON_EU_PROFILE = {"constraints": {"swedish_citizenship": "no", "eu_citizenship": "no",
+                                      "permanent_residence": "no", "work_permit": "yes"}}
+
+    def item(self):
+        """Deliberately hedged, as the evaluator's own output usually is here."""
+        return {
+            "source_job_id": "1", "career_fit": 90, "opportunity_score": 88,
+            "must_have_assessment": [], "blockers": [], "gaps": [],
+        }
+
+    def normalize(self, ad=None, profile=None):
+        return cs.normalize_evaluation_policy(
+            self.item(), {"description": ad or self.AD},
+            eligibility=cs.candidate_eligibility(profile if profile is not None else {}))
+
+    def test_silent_profile_still_preserves_unknown(self):
+        """Turning "we do not know" into "you are rejected" loses real roles."""
+        out = self.normalize(profile={})
+        self.assertEqual({b["type"] for b in out["blockers"]}, {"unknown"})
+
+    def test_a_stated_non_citizen_is_barred_deterministically(self):
+        out = self.normalize(profile=self.NON_EU_PROFILE)
+        self.assertIn("hard", {b["type"] for b in out["blockers"]})
+        self.assertEqual(
+            cs.classify_decision(career_fit=90, opportunity=88, blockers=out["blockers"]),
+            "store_no_notify",
+        )
+
+    def test_a_conditional_demand_is_still_a_dead_end(self):
+        """"Citizenship may be required" cannot be satisfied either; forwarding it
+        as unknown just hands the candidate a role they cannot take."""
+        out = self.normalize(
+            ad="I samband med detta kan krav på visst medborgarskap förekomma.",
+            profile=self.NON_EU_PROFILE)
+        self.assertIn("hard", {b["type"] for b in out["blockers"]})
+
+    def test_a_work_permit_route_is_never_barred(self):
+        """The expensive mistake: rejecting an ad the held permit already satisfies."""
+        out = self.normalize(
+            ad="You are either a Swedish citizen or hold a valid EU work permit.",
+            profile=self.NON_EU_PROFILE)
+        self.assertNotIn("hard", {b["type"] for b in out["blockers"]})
+
+    def test_the_reason_names_what_is_missing(self):
+        out = self.normalize(profile=self.NON_EU_PROFILE)
+        reason = next(b["reason"] for b in out["blockers"] if b["type"] == "hard")
+        self.assertIn("Swedish citizenship", reason)
+        self.assertIn("EU/EEA citizenship", reason)
+        self.assertIn("permanent residence", reason)
+
+    def test_clearance_alone_is_still_preserved_unknown(self):
+        """Answering citizenship must not also decide security clearance."""
+        out = cs.normalize_evaluation_policy(
+            self.item(), {"description": "Security clearance is required for this position."},
+            eligibility=cs.candidate_eligibility(self.NON_EU_PROFILE))
+        self.assertIn("unknown", {b["type"] for b in out["blockers"]})
+
+    def test_profile_reader_accepts_only_a_real_answer(self):
+        for value, resolved in (("no", True), ("yes", True), ("", False), ("maybe", False)):
+            got = cs.candidate_eligibility({"constraints": {"swedish_citizenship": value}})
+            self.assertEqual(got is not None, resolved, value)
+        self.assertIsNone(cs.candidate_eligibility({}))
+
+    def test_a_swedish_citizen_is_barred_on_nothing(self):
+        eligibility = cs.candidate_eligibility({"constraints": {"swedish_citizenship": "yes"}})
+        self.assertEqual(cs.barred_statuses(eligibility), [])
+
+    def test_an_eu_citizen_is_barred_only_on_the_swedish_one(self):
+        eligibility = cs.candidate_eligibility(
+            {"constraints": {"swedish_citizenship": "no", "eu_citizenship": "yes"}})
+        self.assertEqual(cs.barred_statuses(eligibility), ["Swedish citizenship"])
+
+    NON_EU = {"constraints": {"swedish_citizenship": "no", "eu_citizenship": "no",
+                              "permanent_residence": "no", "work_permit": "yes"}}
+
+    def test_prompt_bars_every_status_the_candidate_lacks(self):
+        prompt = cs.semantic_system_prompt(cs.UNKNOWN_LANGUAGE_LEVEL, self.NON_EU)
+        for phrase in ["Swedish citizenship", "EU/EEA citizenship",
+                       "a permanent residence permit", "hard blocker"]:
+            self.assertIn(phrase, prompt, phrase)
+
+    def test_prompt_keeps_the_work_permit_exception(self):
+        """The expensive mistake is rejecting an ad that a held permit satisfies."""
+        prompt = cs.semantic_system_prompt(cs.UNKNOWN_LANGUAGE_LEVEL, self.NON_EU)
+        self.assertIn("no employer sponsorship", prompt)
+        self.assertIn("never a blocker", prompt)
+
+    def test_a_candidate_with_eu_citizenship_is_not_barred_on_it(self):
+        profile = {"constraints": {"swedish_citizenship": "no", "eu_citizenship": "yes",
+                                   "permanent_residence": "no", "work_permit": "yes"}}
+        prompt = cs.semantic_system_prompt(cs.UNKNOWN_LANGUAGE_LEVEL, profile)
+        self.assertIn("Swedish citizenship", prompt)
+        self.assertNotIn("EU/EEA citizenship", prompt)
+
+    def test_a_swedish_citizen_prompt_bars_nothing(self):
+        profile = {"constraints": {"swedish_citizenship": "yes"}}
+        prompt = cs.semantic_system_prompt(cs.UNKNOWN_LANGUAGE_LEVEL, profile)
+        self.assertIn("nationality requirements are met", prompt)
+        self.assertNotIn("hard blocker with the reason", prompt)
+
+    def test_prompt_says_nothing_when_the_profile_is_silent(self):
+        self.assertNotIn("Swedish citizen", cs.semantic_system_prompt(cs.UNKNOWN_LANGUAGE_LEVEL, {}))
+        self.assertNotIn("Swedish citizen", cs.semantic_system_prompt())
+
+    def test_the_engine_names_no_particular_candidate(self):
+        """Same guard as the language level: the answer comes from the profile.
+
+        The clause text lives in the engine, as the language clauses do; what
+        must never live here is which answer applies to whom.
+        """
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        for phrase in ["Amin", "swedish_citizenship\": \"no\"", "swedish_citizenship = \"no\""]:
+            self.assertNotIn(phrase, source, phrase)
+
+    def test_a_swedish_language_requirement_is_not_a_citizenship_one(self):
+        """They share a word and nothing else. Matching the word alone deleted
+        citizenship rows before they could ever become blockers."""
+        self.assertTrue(cs.mentions_swedish_language("Fluent Swedish required"))
+        self.assertTrue(cs.mentions_swedish_language("Flytande svenska"))
+        self.assertFalse(cs.mentions_swedish_language("Swedish citizenship"))
+        self.assertFalse(cs.mentions_swedish_language("Svenskt medborgarskap"))
+
+
+class CoreWorkBlockerPromptTests(unittest.TestCase):
+    """The evaluator over-rates jobs whose subject matter it has already
+    identified as outside the candidate's evidence: it names the gap correctly
+    and then scores it as one bullet among several. The prompt asks for that
+    judgement as a hard blocker, which classify_decision already suppresses."""
+
+    def test_prompt_asks_for_a_hard_blocker_on_core_work(self):
+        prompt = cs.semantic_system_prompt()
+        self.assertIn("Record a hard blocker", prompt)
+        self.assertIn("centre of the job", prompt)
+
+    def test_prompt_keeps_peripheral_gaps_out_of_hard_blockers(self):
+        """Without this the guard would suppress good matches over a nice-to-have."""
+        prompt = cs.semantic_system_prompt()
+        self.assertIn("never a hard blocker", prompt)
+
+    def test_a_core_work_blocker_suppresses_notification(self):
+        """The wiring the prompt relies on: no policy change was needed."""
+        blockers = [{"type": "hard", "reason": "Core job is Golang and IoT locker firmware."}]
+        self.assertEqual(
+            cs.classify_decision(career_fit=84, opportunity=76, blockers=blockers),
+            "store_no_notify",
+        )
+
+    def test_an_unrelated_gap_still_notifies(self):
+        blockers = [{"type": "unknown", "reason": "Years of experience not stated."}]
+        self.assertEqual(
+            cs.classify_decision(career_fit=84, opportunity=76, blockers=blockers),
+            "notify_good",
+        )
 
 
 class RunSummaryTests(unittest.TestCase):

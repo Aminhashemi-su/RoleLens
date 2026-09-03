@@ -272,6 +272,47 @@ None of this applies to a merely *preferred* Swedish requirement, or to an
 advertisement that simply happens to be written in Swedish. Those are never
 blockers at any level.
 
+### Work eligibility
+
+Nationality is the one requirement no amount of role fit can rescue, and it is
+worded almost identically to a requirement an existing permit already satisfies.
+Four optional fields let the policy layer tell the two apart:
+
+```json
+"constraints": {
+  "swedish_citizenship": "no",
+  "eu_citizenship": "yes",
+  "permanent_residence": "no",
+  "work_permit": "yes"
+}
+```
+
+| Field | Effect when `"no"` |
+|---|---|
+| `swedish_citizenship` | Gates the whole feature. Absent, none of this applies. |
+| `eu_citizenship` | An EU/EEA nationality demand becomes a hard blocker too. |
+| `permanent_residence` | A permanent-residence demand becomes a hard blocker. |
+| `work_permit` | Set it to `"yes"` to mark right-to-work requirements **met**. |
+
+**Leaving `swedish_citizenship` out is a real choice, not an oversight.** While
+it is absent, an explicit citizenship demand is preserved as `unknown` and the
+role is still delivered for you to check yourself. Turning "we do not know" into
+"you are rejected" silently loses roles, so the engine will not do it on a guess.
+Once you answer, it stops asking.
+
+What then decides the outcome is what the advertisement actually demands:
+
+| Advertisement says | With the profile above |
+|---|---|
+| "requires Swedish citizenship" | **hard blocker** |
+| "citizenship may be required for vetting" | **hard blocker** — a conditional demand cannot be satisfied either |
+| "Swedish citizen **or** valid EU work permit" | **met** — a permit route is offered |
+| "we cannot offer visa sponsorship" | **met** — the permit is already held |
+
+A background or security *screening* is not a citizenship requirement and never
+becomes one on its own. Where an advertisement demands a clearance without tying
+it to nationality, that stays `unknown`, exactly as before.
+
 ### Scheduler timeout
 
 Whatever runs RoleLens on a schedule — cron, a systemd timer, a CI schedule, a
@@ -293,7 +334,7 @@ not inherit provider credentials from the scheduler.
 | Variable | Required | Purpose |
 |---|---|---|
 | `VERTEX_GEMINI_API_KEY` | yes | Primary evaluator. |
-| `VERTEX_GEMINI_MODEL` | yes | Primary model id, e.g. `gemini-3.7-flash`. |
+| `VERTEX_GEMINI_MODEL` | yes | Primary model id, e.g. `gemini-3.8-flash`. |
 | `AZURE_OPENAI_API_KEY` | yes | Transport fallback. |
 | `AZURE_OPENAI_BASE_URL` | yes | Azure deployment endpoint. |
 | `AZURE_OPENAI_DEPLOYMENT` | yes | Azure deployment name. |
