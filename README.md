@@ -32,6 +32,29 @@ third-party Python package at runtime.
 
 ---
 
+## What it looks like
+
+RoleLens evaluates the actual work behind a vacancy, explains why it may fit,
+highlights gaps and uncertainties, and sends the strongest opportunities to your
+preferred channel.
+
+### Strong match
+
+<img src="docs/images/rolelens-strong-match.jpg" width="420">
+
+Both scores high: the work itself fits, and nothing in the advertisement stands
+in the way.
+
+### Fit with gaps and uncertainty
+
+<img src="docs/images/rolelens-nuanced-match.jpg" width="420">
+
+The same shape of output, judged honestly. The work still fits, but the gaps are
+named and an eligibility question is flagged as *unknown* rather than guessed at
+— which is why `opportunity_score` sits below `career_fit`.
+
+---
+
 ## Two scores, not one
 
 A single "match score" cannot answer the only two questions that matter, because
