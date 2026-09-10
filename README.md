@@ -425,14 +425,16 @@ Only then is the decision computed, from validated numbers:
 python3 -m unittest discover -s tests -v
 ```
 
-109 tests. No network, no API key, no cost. They cover the decision classifier,
-the Swedish-language policy rules, provider routing and fallback semantics,
-database idempotency and re-queueing on content change, snapshot completeness,
-completeness gaps versus transport failures, the bounded cleanup pass, global
-ranking and delivery ordering, the emergency runtime budget and candidate
-ceiling, repost suppression, the run-summary wording in every state, the
-language-level scale and policy at every level, fresh-clone installation, and
-the doctor onboarding states.
+168 tests. No network, no API key, no cost. They cover the decision classifier,
+the Swedish-language policy rules, citizenship and work-eligibility resolution,
+the core-work blocker, provider routing and fallback semantics including which
+failure triggered a fallback, database idempotency and re-queueing on content
+change, snapshot completeness, completeness gaps versus transport failures, the
+bounded cleanup pass, global ranking and delivery ordering, the emergency runtime
+budget and candidate ceiling, repost suppression, the run-summary wording in
+every state, the language-level scale and policy at every level, historical
+recovery (`backfill` selection, evaluation, delivery and run accounting),
+fresh-clone installation, and the doctor onboarding states.
 
 ---
 
@@ -488,7 +490,7 @@ Methodology and results are in
 
 ## Project status
 
-Version **1.5.3**. Running daily in production for a single user, against the
+Version **1.9.0**. Running daily in production for a single user, against the
 Swedish market, since 2026. It is a personal tool published because the design
 is more broadly interesting, not a product.
 
