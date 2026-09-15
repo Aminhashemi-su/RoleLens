@@ -3,10 +3,104 @@
 RoleLens was developed under an earlier internal name before this repository
 existed, so V1.1–V1.4 have no individual Git commits. This file records the
 known major versions instead. Version 1.5.1 is the first state captured in
-Git; 1.9.0 is the current release.
+Git; 2.0.0 is the current release.
 
 The format is loosely [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project does not follow strict semantic versioning.
+
+## [2.0.0] — 2026-09-15
+
+From keyword search to the whole market. Version 1 only ever saw the ads its
+search words happened to find, and then paid the judge for every one of them.
+Version 2 reads every new Platsbanken ad and the career sites you choose, ranks
+them against the profile without a model, and spends the model only where
+nothing cheaper can decide.
+
+### Added
+- **JobStream discovery.** Every Platsbanken ad added or changed since the last
+  run, from a stored cursor that advances only after the ads are stored. A stale
+  cursor is clamped to `jobstream_max_window_hours` and reported. In a
+  measurement against a day of the feed, the keyword queries of a well-tuned 1.x
+  configuration reached 2 of 20 relevant digitalisation roles.
+- **Career-site collectors** for Teamtailor, Varbi, Greenhouse, Lever, Ashby,
+  SmartRecruiters, Workday and SAP SuccessFactors, configured per site in
+  `config.career_sites`. Postings already stored from Platsbanken are left out;
+  detail pages are fetched once per posting within `career_site_max_details`.
+  Checked employers listed many Swedish jobs on their own sites that Platsbanken
+  did not carry. See `docs/career-sites.md`.
+- **Profile-based ranking.** A weighted role vocabulary (`role_vocabulary.json`),
+  gemini-embedding-001 similarity to the matcher profile's sections, and the
+  competencies JobTech's JobAd Enrichments API finds requested, fused with
+  reciprocal rank fusion. The top `evaluate_top_share` (15%) of recent ads is
+  evaluated, plus a deterministic random `explore_share` (3%) of the rest, so a
+  ranking miss is still delivered and visible. In calibration the 15% cut kept
+  101 of 102 held-out delivered matches with enrichment; embeddings failing
+  degrade to the vocabulary at a wider share instead of stopping the run.
+- **Deterministic screening before any model call**: management titles and
+  years of experience against the dated roles of an optional
+  `knowledge_catalogue.json`, student roles (`exclude_student_roles`), a
+  nationality the profile says the candidate lacks, and mandatory Swedish above
+  the configured level.
+- **Seniority rules.** Years of experience counted from the catalogue (overlapping
+  roles once). A requirement two or more years beyond it is a hard blocker, a
+  smaller gap or a senior/lead/principal/architect title caps the ad at a
+  stretch, and a head-of/director/team-leader title is a hard blocker. Early-career
+  wording switches these off.
+- **Years in a named field.** The judge reports "Years in field:" requirements;
+  a gap caps the ad at a stretch and never removes a card it would otherwise be.
+- **Optional first read** (`triage_model`, e.g. gemini-2.5-flash-lite). It sees
+  a compact card built from the profile — including the new optional
+  `out_of_scope_work` list — and settles only confident rejections below fit 50.
+  Over a few hundred judged ads it settled about three quarters of them, lost no
+  delivered match, and cut the cost per ad by about 70%. It fails open.
+- **Second judgement near the card line.** An ad scored 52–77 is judged again
+  and decided on the mean; a hard blocker counts only if both judgements found
+  it. Identical re-judges had flipped about one card in seven in that band.
+- **Monthly budget.** `monthly_budget_usd` pauses judging once the estimated
+  month-to-date spend reaches it; ranking and delivery continue and nothing
+  queued is lost. `status` shows the estimate.
+- **Alerts** for a failing discovery source, a provider refusing the account,
+  unavailable embeddings, the budget, and a failing first-read model.
+- `status` counts jobs per source; `--version`; a GitHub Actions workflow runs
+  the suite on Linux, macOS and Windows, plus the public-safety scan.
+
+### Changed
+- **A run with no match and no problem prints nothing**, so cron sends no mail
+  and a chat scheduler sends no message. Matches, alerts and failures always
+  print, and a failed run still exits non-zero.
+- A stretch card now also needs `career_fit ≥ 75`.
+- Only ranked-and-selected ads enter the evaluation queue; the queue is read in
+  rank order.
+- The Azure fallback also answers when Vertex refuses the account (401, 403,
+  404, or an invalid key), not only on transport failures.
+- Discovery order no longer rewards title words; `high_signal_title_terms` is no
+  longer read. JobSearch is optional and runs only when `search_terms` is set.
+- Discovery is isolated per source: one failing source is reported and the rest
+  run; only every enabled source failing exits non-zero.
+- Judge output budget raised to 24,000 tokens after a live batch was cut off.
+- Database schema 3 adds ranking columns and a `profile_embeddings` table,
+  migrated in place from 1 and 2.
+- The run lock works on Windows as well as POSIX.
+- `config.json` is validated more strictly, with messages naming the key.
+
+### Fixed
+- A database whose schema check failed left its SQLite connection open.
+
+### Privacy
+- `career_profile.json` is still never read by the pipeline. The descriptive
+  sections of `matcher_profile.json`, already sent to the judge, are now also
+  sent to the Vertex embedding endpoint and — with `use_enrichment` — to
+  JobTech's public enrichment API, once per profile version.
+
+### Upgrading
+- Re-run `./install.sh`; it adds `role_vocabulary.json` and
+  `knowledge_catalogue.json` from the examples. Replace both with your own, or
+  delete the catalogue.
+- Merge the new keys from `config.example.json`. Existing search terms keep
+  working.
+- Changing the matcher profile, vocabulary or catalogue re-ranks recent ads;
+  profile or catalogue changes also re-judge them, as before.
+- Tests: 216, up from 168.
 
 ## [1.9.0] — 2026-09-03
 

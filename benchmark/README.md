@@ -15,8 +15,7 @@ drift away from production behaviour.
 
 ## Requirements
 
-Python 3.11+ on Linux or macOS. `rolelens.py` imports `fcntl`, so the runner
-inherits that constraint. Nothing to install.
+Python 3.11+ on Linux, macOS or Windows. Nothing to install.
 
 ## Commands
 

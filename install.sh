@@ -8,6 +8,9 @@ set -euo pipefail
 # the home directory is never overwritten, so your edited configuration, profile
 # and secrets survive every re-install. Pass --refresh-config to deliberately
 # push config/profile from this checkout over what is already installed.
+#
+# Hermes Agent runs cron scripts only from ~/.hermes/scripts, so install for it
+# with:  ROLELENS_SCRIPTS_HOME="$HOME/.hermes" ./install.sh
 
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROLELENS_DIR="${ROLELENS_HOME:-$HOME/.rolelens}"
@@ -25,6 +28,11 @@ Usage: ./install.sh [--refresh-config]
                       the shipped examples. Existing files are left untouched.
   --refresh-config    Also overwrite installed config/profile files from this
                       checkout. Never touches secrets.env.
+
+Environment:
+  ROLELENS_HOME          home directory (default: ~/.rolelens)
+  ROLELENS_SCRIPTS_HOME  the script goes to $ROLELENS_SCRIPTS_HOME/scripts
+                         (default: ~/.local; use ~/.hermes for Hermes Agent)
 USAGE
       exit 0 ;;
     *) echo "install.sh: unknown argument: $arg" >&2; exit 2 ;;
@@ -97,12 +105,10 @@ install_dir "$SCRIPTS_DIR"
 
 install_file "$ROLELENS_DIR/config.json" \
              "$SOURCE_DIR/config.json" "$SOURCE_DIR/config.example.json"
-install_file "$ROLELENS_DIR/profile/career_profile.json" \
-             "$SOURCE_DIR/profile/career_profile.json" "$SOURCE_DIR/profile/career_profile.example.json"
-install_file "$ROLELENS_DIR/profile/matcher_profile.json" \
-             "$SOURCE_DIR/profile/matcher_profile.json" "$SOURCE_DIR/profile/matcher_profile.example.json"
-install_file "$ROLELENS_DIR/profile/search_lenses.json" \
-             "$SOURCE_DIR/profile/search_lenses.json" "$SOURCE_DIR/profile/search_lenses.example.json"
+for stem in career_profile matcher_profile search_lenses role_vocabulary knowledge_catalogue; do
+  install_file "$ROLELENS_DIR/profile/$stem.json" \
+               "$SOURCE_DIR/profile/$stem.json" "$SOURCE_DIR/profile/$stem.example.json"
+done
 install_file "$ROLELENS_DIR/profile/matcher_rules_v1_1.json" \
              "$SOURCE_DIR/profile/matcher_rules_v1_1.json"
 
@@ -151,15 +157,16 @@ cat <<EOF
 
 Next:
   1. Edit your configuration and profile:
-       $ROLELENS_DIR/config.json
-       $ROLELENS_DIR/profile/matcher_profile.json    <- sent to the model each run
-       $ROLELENS_DIR/profile/career_profile.json     <- your local evidence base
-       $ROLELENS_DIR/profile/search_lenses.json
+       $ROLELENS_DIR/config.json                        <- sources, career sites, limits
+       $ROLELENS_DIR/profile/matcher_profile.json       <- sent to the model; its sections rank jobs
+       $ROLELENS_DIR/profile/role_vocabulary.json       <- weighted role terms that rank jobs
+       $ROLELENS_DIR/profile/knowledge_catalogue.json   <- dated roles and skill levels (optional)
+       $ROLELENS_DIR/profile/career_profile.json        <- your local evidence base, never sent
   2. Add provider credentials:
        $ROLELENS_DIR/secrets.env
   3. Check the installation without spending anything:
        python3 $SCRIPTS_DIR/rolelens.py doctor
-  4. Discovery only, ZERO LLM cost:
+  4. Discovery only, ZERO model cost:
        python3 $SCRIPTS_DIR/rolelens.py --verbose fetch
   5. Inspect local counters:
        python3 $SCRIPTS_DIR/rolelens.py status

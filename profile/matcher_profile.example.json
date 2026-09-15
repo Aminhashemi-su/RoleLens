@@ -56,6 +56,13 @@
     "Implementation-oriented Technology Consulting",
     "Selected technical product roles"
   ],
+  "out_of_scope_work": [
+    "Health care, teaching, trades, driving, hospitality or retail work",
+    "Embedded, firmware, hardware, electronics or PLC engineering",
+    "Roles built on Java, .NET/C#, C/C++ or SAP",
+    "Pure sales, account management or project management without building",
+    "Platform/SRE ownership of Kubernetes clusters"
+  ],
   "important_cautions": [
     "Do not infer staff/principal engineering seniority from a small-team title.",
     "Do not claim ML research or data-science specialization; the evidence is application engineering.",

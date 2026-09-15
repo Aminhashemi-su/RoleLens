@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""RoleLens, semantic Swedish job discovery with deterministic orchestration.
+"""RoleLens: semantic Swedish job discovery with deterministic orchestration.
 
 Runtime design:
-  * Arbetsförmedlingen JobSearch does discovery for zero LLM tokens.
+  * Discovery costs no model tokens. Arbetsförmedlingen JobStream delivers
+    every Platsbanken ad added or changed, optional JobSearch queries reach the
+    open backlog, and built-in collectors read public career-site feeds.
+  * Every new or edited ad is ranked against the candidate profile - a weighted
+    role vocabulary, profile embeddings and the competencies JobTech's
+    enrichment finds requested - and only the top share reaches a model. No
+    title decides anything on its own.
+  * Deterministic rules settle what needs no model, an optional cheap first
+    read settles clear rejections, and the judge evaluates the rest.
   * SQLite provides durable idempotency and evaluation history.
-  * Vertex Gemini performs semantic evaluation, with one Azure transport fallback.
+  * Vertex Gemini performs semantic evaluation, with one Azure fallback.
   * stdout is reserved for user notifications, so a script-only scheduler can
     deliver it verbatim. Operational logs always go to stderr.
 
@@ -14,14 +22,17 @@ The runtime has no third-party Python dependencies.
 from __future__ import annotations
 
 import argparse
+import array
 import contextlib
 import dataclasses
 import datetime as dt
-import fcntl
+import email.utils
 import hashlib
 import html
 import json
 import logging
+import math
+import operator
 import os
 import random
 import re
@@ -29,22 +40,101 @@ import sqlite3
 import stat
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+
+try:  # POSIX run lock
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+    import msvcrt
 
 APP_NAME = "rolelens"
-APP_VERSION = "1.9.0"
-SCHEMA_VERSION = "2"
+APP_VERSION = "2.0.0"
+SCHEMA_VERSION = "3"
 DEFAULT_HOME = Path.home() / ".rolelens"
+PROJECT_URL = "https://github.com/Aminhashemi-su/RoleLens"
+JOBSTREAM_BASE_URL = "https://jobstream.api.jobtechdev.se"
+JOBSTREAM_CURSOR_KEY = "jobstream_cursor"
 JOBSEARCH_BASE_URL = "https://jobsearch.api.jobtechdev.se"
 GEMINI_BASE_URL = "https://aiplatform.googleapis.com/v1/publishers/google/models"
 PRIMARY_PROVIDER = "vertex_gemini"
 FALLBACK_PROVIDER = "azure_gpt5mini"
 RETRYABLE_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+# Answers meaning the provider will not serve this account at all: a bad key,
+# missing permission, billing or credit switched off, or a retired model.
+ACCESS_REFUSED_HTTP_CODES = {401, 403, 404}
 UTC = dt.timezone.utc
+
+# Ranking. These were calibrated together against a full day of Platsbanken and
+# the matches an earlier keyword-search build had delivered; changing one of
+# them invalidates that measurement, so they are constants rather than settings.
+DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_USD_PER_MILLION_TOKENS = {"gemini-embedding-001": 0.15}
+# Judge tokens are priced at Gemini Flash rates (input, output per million), the
+# dearer of the two providers, so the budget estimate errs high.
+JUDGE_USD_PER_MILLION_TOKENS = (0.75, 3.75)
+# Room for a batch of ten evaluations plus the model's thinking, which counts
+# against the same limit. At 12,000 a live answer was cut off mid-string. Only
+# tokens actually produced are billed.
+JUDGE_MAX_OUTPUT_TOKENS = 24_000
+# The first read: a cheap model reads every ad the rules let through and settles
+# the clear rejections; whatever it passes or is unsure about goes to the judge.
+# Priced at gemini-2.5-flash-lite rates, input and output per million tokens.
+TRIAGE_USD_PER_MILLION_TOKENS = (0.10, 0.40)
+TRIAGE_MAX_OUTPUT_TOKENS = 8_192
+# Head and tail of each description: requirements usually close an ad.
+TRIAGE_DESCRIPTION_CHARS = 2_400
+# A rejection settles an ad only below this fit. Over a few hundred judged ads,
+# with a thinking budget of 1024, any cut from 45 to 60 settled three quarters of
+# them and lost no ad the rules would send as a card. Without thinking the first
+# read rejected genuine matches, so thinking stays on by default.
+TRIAGE_SETTLE_BELOW_FIT = 50
+EMBEDDING_DIMENSIONS = 768
+RANK_TEXT_CHARS = 3000  # title plus description, read by both scores
+PROFILE_FACET_CHARS = 6000
+RRF_K = 60
+# Below this many ranked ads a percentile says little, so selection fails open.
+RANKING_MIN_POOL = 200
+# Ads embedded per progress step, so a failure part-way keeps what was done.
+EMBEDDING_CHUNK = 200
+# Vertex meters embedding input tokens per minute. A 429 from that quota is
+# waited out rather than treated as a failure, within a bound per run; a first
+# day's backlog needs one or two pauses, a routine run none.
+EMBEDDING_QUOTA_PAUSE_SECONDS = 60
+EMBEDDING_QUOTA_MAX_PAUSES = 10
+# Arbetsförmedlingen's JobAd Enrichments API: the competencies and occupations an
+# ad requests, each with the probability that the employer really requires it.
+# Free and keyless. As a third ranking order it kept 100 of 102 held-out matches
+# at the 15% cut, against 96 without it.
+ENRICHMENT_URL = "https://jobad-enrichments-api.jobtechdev.se/enrichtextdocuments"
+ENRICHMENT_BATCH = 10
+ENRICHMENT_PREDICTION_FLOOR = 0.5
+ENRICHMENT_VERSION = "profile-concepts-v1"
+# The parts of matcher_profile.json that say who the candidate is. Constraints,
+# cautions and policy say how to judge, and stay out. career_profile.json is
+# never read here, so it still never leaves the machine.
+PROFILE_FACET_SECTIONS: tuple[str, ...] = (
+    "candidate_core", "differentiators", "strong_capabilities", "secondary_capabilities",
+    "technology_evidence", "education_signal", "role_families_to_recognize_semantically",
+)
+RANKING_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("rank_content_hash", "TEXT"),
+    ("rank_profile_key", "TEXT"),
+    ("vocabulary_score", "REAL"),
+    ("embedding_score", "REAL"),
+    ("enrichment_score", "REAL"),
+    ("enrichment_json", "TEXT"),
+    ("rank_percentile", "REAL"),
+    ("selection_state", "TEXT"),
+    ("selection_reason", "TEXT"),
+    ("ranked_at", "TEXT"),
+)
 
 # Platsbanken deadlines are Swedish calendar dates. Comparing them against the
 # UTC date keeps a vacancy that closed at midnight alive for the last hour or
@@ -169,9 +259,9 @@ def normalize_language_level(value: Any) -> LanguageLevel:
 def candidate_language_level(profile: Mapping[str, Any], language: str = "swedish") -> LanguageLevel:
     """Read one candidate language level from the matcher profile.
 
-    Looks at `constraints.<language>` first, which is where the existing schema
-    already keeps it, then at an optional `languages.<language>` map. Anything
-    missing or unparseable is UNKNOWN.
+    Looks at `constraints.<language>` first, which is where the profile schema
+    keeps it, then at an optional `languages.<language>` map. Anything missing or
+    unparseable is UNKNOWN.
     """
     if not isinstance(profile, Mapping):
         return UNKNOWN_LANGUAGE_LEVEL
@@ -185,7 +275,7 @@ def candidate_language_level(profile: Mapping[str, Any], language: str = "swedis
 
 
 class RoleLensError(RuntimeError):
-    """Expected operational failure that should make a cron run fail loudly."""
+    """Expected operational failure that should make a scheduled run fail loudly."""
 
 
 class ConfigurationError(RoleLensError):
@@ -199,8 +289,8 @@ class RemoteAPIError(RoleLensError):
 class RateLimitError(RemoteAPIError):
     """Remote provider rate limit after bounded HTTP retries.
 
-    This is recoverable for RoleLens: jobs remain pending and the next
-    scheduled run can resume without losing discovery state.
+    This is recoverable: jobs remain pending and the next scheduled run can
+    resume without losing discovery state.
     """
 
 
@@ -230,6 +320,24 @@ class TemporaryProviderError(RemoteAPIError):
         return f"transport_{match.group(1)}" if match else "transport_unknown"
 
 
+class ProviderAccessError(RemoteAPIError):
+    """The provider refused this account: a bad key, missing permission, billing
+    or credit switched off, or a model it no longer serves.
+
+    Not temporary, yet the other provider can still judge the jobs, so
+    orchestration falls back exactly as it does for a transport failure.
+    """
+
+    def __init__(self, provider: str, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.status = status
+
+    @property
+    def reason(self) -> str:
+        return f"access_http_{self.status}"
+
+
 class ModelOutputError(RemoteAPIError):
     """Provider answered, but the model output violated the evaluation contract."""
 
@@ -254,6 +362,81 @@ class ModelOutputError(RemoteAPIError):
         }
 
 
+# ---------------------------------------------------------------------------
+# Career sites: company job boards RoleLens reads directly.
+#
+# Each entry in config.career_sites names a platform and the few values that
+# platform needs. Everything else in the entry is passed to the collector as an
+# option. See docs/career-sites.md.
+# ---------------------------------------------------------------------------
+CAREER_SITE_REQUIRED: dict[str, tuple[str, ...]] = {
+    "teamtailor": ("url",),
+    "varbi": ("url",),
+    "greenhouse": ("board",),
+    "lever": ("board",),
+    "ashby": ("board",),
+    "smartrecruiters": ("board",),
+    "workday": ("url", "tenant", "site"),
+    "successfactors": ("url",),
+}
+_CAREER_SITE_NAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
+_CAREER_SITE_FIELDS = frozenset({"platform", "name", "url", "company", "enabled"})
+
+
+@dataclasses.dataclass(frozen=True)
+class CareerSite:
+    """One configured career site."""
+
+    name: str
+    platform: str
+    url: str
+    company: str
+    options: Mapping[str, Any]
+
+    def option(self, key: str, default: Any = None) -> Any:
+        value = self.options.get(key)
+        return default if value is None else value
+
+
+def parse_career_sites(value: Any) -> tuple[CareerSite, ...]:
+    """Validate config.career_sites. A disabled entry is checked, then skipped."""
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigurationError("config.career_sites must be a list of career-site objects")
+    sites: list[CareerSite] = []
+    names: set[str] = set()
+    for index, entry in enumerate(value):
+        where = f"config.career_sites[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigurationError(f"{where} must be an object")
+        platform = str(entry.get("platform", "")).strip().casefold()
+        if platform not in CAREER_SITE_REQUIRED:
+            raise ConfigurationError(
+                f"{where}.platform must be one of: {', '.join(sorted(CAREER_SITE_REQUIRED))}")
+        name = str(entry.get("name", "")).strip()
+        if not _CAREER_SITE_NAME.match(name):
+            raise ConfigurationError(
+                f"{where}.name must be a short lowercase id such as 'acme' (letters, digits, '.', '_', '-')")
+        if name in names:
+            raise ConfigurationError(f"{where}.name {name!r} is used by another career site")
+        names.add(name)
+        for key in CAREER_SITE_REQUIRED[platform]:
+            if not isinstance(entry.get(key), str) or not entry[key].strip():
+                raise ConfigurationError(f"{where} ({platform}) needs a non-empty {key!r}")
+        url = str(entry.get("url") or "").strip().rstrip("/")
+        if url and not url.startswith("https://"):
+            raise ConfigurationError(f"{where}.url must start with https://")
+        enabled = entry.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigurationError(f"{where}.enabled must be true or false")
+        if not enabled:
+            continue
+        options = {key: item for key, item in entry.items() if key not in _CAREER_SITE_FIELDS}
+        sites.append(CareerSite(name, platform, url, str(entry.get("company") or "").strip(), options))
+    return tuple(sites)
+
+
 @dataclasses.dataclass(frozen=True)
 class Settings:
     home: Path
@@ -263,23 +446,43 @@ class Settings:
     lock_path: Path
     primary_provider: str
     fallback_provider: str
+    use_jobstream: bool
+    jobstream_lookback_hours: int
+    jobstream_max_window_hours: int
     search_terms: tuple[str, ...]
     location_terms: tuple[str, ...]
     include_unlocated_searches: bool
     search_limit: int
     query_delay_seconds: float
+    career_sites: tuple[CareerSite, ...]
+    career_site_max_details: int
     max_candidates_per_run: int
     max_jobs_per_batch: int
     max_run_seconds: int
     max_prompt_chars: int
     max_job_description_chars: int
     max_notifications_per_run: int
+    jobstream_timeout_seconds: int
     jobsearch_timeout_seconds: int
+    career_site_timeout_seconds: int
     gateway_timeout_seconds: int
     http_retries: int
     northern_exclusions: tuple[str, ...]
     preferred_locations: tuple[str, ...]
-    high_signal_title_terms: tuple[str, ...]
+    evaluate_top_share: float
+    degraded_top_share: float
+    explore_share: float
+    use_enrichment: bool
+    exclude_student_roles: bool
+    ranking_reference_days: int
+    max_rank_per_run: int
+    embedding_model: str
+    embedding_batch_size: int
+    embedding_timeout_seconds: int
+    monthly_budget_usd: float
+    triage_model: str
+    triage_thinking_budget: int
+    triage_batch_size: int
 
     @classmethod
     def load(cls, home: Path) -> "Settings":
@@ -290,6 +493,8 @@ class Settings:
             raw = json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ConfigurationError(f"Cannot read {config_path}: {exc}") from exc
+        if not isinstance(raw, dict):
+            raise ConfigurationError(f"{config_path} must hold a JSON object")
 
         def strings(key: str) -> tuple[str, ...]:
             value = raw.get(key, [])
@@ -303,6 +508,58 @@ class Settings:
                 raise ConfigurationError(f"config.{key} must be a positive integer")
             return value
 
+        def positive_number(key: str, default: float) -> float:
+            value = raw.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise ConfigurationError(f"config.{key} must be a positive number")
+            return float(value)
+
+        def non_negative_number(key: str, default: float) -> float:
+            value = raw.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                raise ConfigurationError(f"config.{key} must be a number of at least 0")
+            return float(value)
+
+        def share(key: str, default: float) -> float:
+            value = raw.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1:
+                raise ConfigurationError(f"config.{key} must be a number above 0 and at most 1")
+            return float(value)
+
+        def fraction(key: str, default: float) -> float:
+            value = raw.get(key, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+                raise ConfigurationError(f"config.{key} must be a number from 0 to 1")
+            return float(value)
+
+        def boolean(key: str, default: bool) -> bool:
+            value = raw.get(key, default)
+            if not isinstance(value, bool):
+                raise ConfigurationError(f"config.{key} must be true or false")
+            return value
+
+        embedding_model = str(raw.get("embedding_model", DEFAULT_EMBEDDING_MODEL)).strip()
+        if not embedding_model:
+            raise ConfigurationError("config.embedding_model must be a non-empty string")
+        triage_model = raw.get("triage_model", "")
+        if not isinstance(triage_model, str):
+            raise ConfigurationError("config.triage_model must be a model name, or empty to let the judge read every ad")
+        triage_thinking_budget = raw.get("triage_thinking_budget", 1024)
+        if (
+            isinstance(triage_thinking_budget, bool)
+            or not isinstance(triage_thinking_budget, int)
+            or not (triage_thinking_budget == 0 or 512 <= triage_thinking_budget <= 24_576)
+        ):
+            raise ConfigurationError("config.triage_thinking_budget must be 0, or from 512 to 24576 tokens")
+
+        use_jobstream = boolean("use_jobstream", True)
+        search_terms = strings("search_terms")
+        career_sites = parse_career_sites(raw.get("career_sites"))
+        if not (use_jobstream or search_terms or career_sites):
+            raise ConfigurationError(
+                "config.json enables no discovery source: turn on use_jobstream, "
+                "or add search_terms or career_sites")
+
         home = home.expanduser().resolve()
         return cls(
             home=home,
@@ -312,11 +569,21 @@ class Settings:
             lock_path=home / str(raw.get("lock_file", "data/rolelens.lock")),
             primary_provider=str(raw.get("primary_provider", PRIMARY_PROVIDER)),
             fallback_provider=str(raw.get("fallback_provider", FALLBACK_PROVIDER)),
-            search_terms=strings("search_terms"),
+            use_jobstream=use_jobstream,
+            # Hours of stream replayed when there is no cursor yet, and the widest
+            # window ever requested. An outage longer than that loses the gap
+            # rather than asking JobStream for a month of history in one call.
+            jobstream_lookback_hours=min(168, positive_int("jobstream_lookback_hours", 24)),
+            jobstream_max_window_hours=min(168, positive_int("jobstream_max_window_hours", 72)),
+            search_terms=search_terms,
             location_terms=strings("location_terms"),
-            include_unlocated_searches=bool(raw.get("include_unlocated_searches", True)),
+            include_unlocated_searches=boolean("include_unlocated_searches", True),
             search_limit=min(100, positive_int("search_limit", 50)),
-            query_delay_seconds=max(0.0, float(raw.get("query_delay_ms", 120)) / 1000.0),
+            query_delay_seconds=non_negative_number("query_delay_ms", 120) / 1000.0,
+            career_sites=career_sites,
+            # Detail pages fetched per career site per run, on the platforms whose
+            # listing carries no description. A large board fills in over a few runs.
+            career_site_max_details=min(200, positive_int("career_site_max_details", 40)),
             # Completeness beats punctuality: a run evaluates its whole frozen
             # snapshot. The two limits below are emergency valves, not throughput
             # caps - one bounds snapshot memory, the other bounds wall clock.
@@ -326,12 +593,39 @@ class Settings:
             max_prompt_chars=positive_int("max_prompt_chars", 180_000),
             max_job_description_chars=positive_int("max_job_description_chars", 9_000),
             max_notifications_per_run=positive_int("max_notifications_per_run", 8),
+            jobstream_timeout_seconds=positive_int("jobstream_timeout_seconds", 90),
             jobsearch_timeout_seconds=positive_int("jobsearch_timeout_seconds", 30),
+            career_site_timeout_seconds=positive_int("career_site_timeout_seconds", 45),
             gateway_timeout_seconds=positive_int("gateway_timeout_seconds", 150),
             http_retries=min(8, positive_int("http_retries", 4)),
             northern_exclusions=tuple(x.casefold() for x in strings("northern_exclusions")),
             preferred_locations=strings("preferred_locations"),
-            high_signal_title_terms=tuple(x.casefold() for x in strings("high_signal_title_terms")),
+            # The share of the ranking window the evaluator reads, and the share
+            # for ads ranked while embeddings were unavailable. In calibration
+            # every delivered match sat in the top few percent of the ranking;
+            # 15% lies between cuts that kept 92 and 101 of 102 held-out matches.
+            # The vocabulary alone needs the wider 30%.
+            evaluate_top_share=share("evaluate_top_share", 0.15),
+            degraded_top_share=share("degraded_top_share", 0.30),
+            # A random sample of the ads the cut leaves out is judged anyway, so a
+            # match the ranking misses is still delivered and the miss is visible.
+            explore_share=fraction("explore_share", 0.03),
+            # Rank on the competencies each ad requests as a third order.
+            use_enrichment=boolean("use_enrichment", True),
+            # Internships, theses and student jobs are outside a full-time search.
+            exclude_student_roles=boolean("exclude_student_roles", True),
+            ranking_reference_days=min(14, positive_int("ranking_reference_days", 3)),
+            max_rank_per_run=min(20_000, positive_int("max_rank_per_run", 6_000)),
+            embedding_model=embedding_model,
+            embedding_batch_size=min(50, positive_int("embedding_batch_size", 20)),
+            embedding_timeout_seconds=positive_int("embedding_timeout_seconds", 60),
+            # Estimated provider spend per UTC month; judging pauses once it is reached.
+            monthly_budget_usd=positive_number("monthly_budget_usd", 50.0),
+            # A cheap model reads each ad first and settles the clear rejections;
+            # empty sends every ad straight to the judge.
+            triage_model=triage_model.strip(),
+            triage_thinking_budget=triage_thinking_budget,
+            triage_batch_size=min(40, positive_int("triage_batch_size", 20)),
         )
 
 
@@ -407,10 +701,26 @@ class Evaluation:
 
 @dataclasses.dataclass
 class RunStats:
+    # JobStream. `stream_entries` counts everything returned, unpublications
+    # included; `unique_jobs` counts live ads kept from the stream.
+    stream_entries: int = 0
+    stream_removed: int = 0
+    stream_malformed: int = 0
+    stream_window_clamped: bool = False
+    unique_jobs: int = 0
+    # JobSearch keyword queries.
     queries_attempted: int = 0
     queries_succeeded: int = 0
     search_hits: int = 0
-    unique_jobs: int = 0
+    # Career sites read, failed, postings seen, stored, and left out because the
+    # same vacancy is already stored from another source.
+    career_sites_read: int = 0
+    career_sites_failed: int = 0
+    career_site_jobs_seen: int = 0
+    career_site_jobs_stored: int = 0
+    career_site_jobs_known: int = 0
+    # Sources that failed while the others were still read.
+    discovery_failures: list[str] = dataclasses.field(default_factory=list)
     jobs_upserted: int = 0
     jobs_prefiltered: int = 0
     pending_selected: int = 0
@@ -427,9 +737,46 @@ class RunStats:
     batches_processed: int = 0
     cleanup_batches: int = 0
     duplicates_suppressed: int = 0
+    # Settled without a model because the deterministic rules block the ad.
+    rules_screened: int = 0
     snapshot_size: int = 0
     unresolved: int = 0
     deferred: int = 0
+    # Ranking: ads scored this run, how many reached the evaluator, and whether
+    # the percentile was trusted (fail_open) and embeddings answered (degraded).
+    jobs_ranked: int = 0
+    jobs_selected: int = 0
+    jobs_explored: int = 0
+    ranking_pool: int = 0
+    ranking_fail_open: bool = False
+    ranking_degraded: bool = False
+    embedding_calls: int = 0
+    embedding_tokens: int = 0
+    embedding_quota_pauses: int = 0
+    # Why embeddings failed this run (http_403, http_429, ...), or None.
+    embedding_failure: str | None = None
+    # Ads enriched this run, and why enrichment failed if it did.
+    jobs_enriched: int = 0
+    enrichment_failure: str | None = None
+    # The monthly budget, the estimated spend before this run, whether judging
+    # was paused because of it, and how many jobs were left waiting.
+    budget_usd: float = 0.0
+    month_to_date_usd: float = 0.0
+    budget_paused: bool = False
+    budget_waiting: int = 0
+    # The first read: calls made, ads it settled, ads it sent to the judge, its
+    # tokens, and the failure that switched it off for the run, if any.
+    triage_calls: int = 0
+    triage_settled: int = 0
+    triage_escalated: int = 0
+    triage_prompt_tokens: int = 0
+    triage_completion_tokens: int = 0
+    triage_reasoning_tokens: int = 0
+    triage_failure: str | None = None
+    # Ads judged a second time because the first score sat near the card line,
+    # and how many of those moved between card and no card.
+    second_judgements: int = 0
+    second_judgement_changes: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -446,8 +793,33 @@ class ProviderBatchResult:
     error_kind: str | None = None
 
 
+def _acquire_lock(handle: Any) -> bool:
+    """Take an exclusive non-blocking lock; False when another process holds it."""
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+    handle.seek(0)
+    try:  # pragma: no cover - Windows
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:  # pragma: no cover - Windows
+        return False
+    return True  # pragma: no cover - Windows
+
+
+def _release_lock(handle: Any) -> None:
+    with contextlib.suppress(OSError):
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        else:  # pragma: no cover - Windows
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 class FileLock:
-    """Non-blocking process lock. A second cron tick exits quietly."""
+    """Non-blocking process lock. A second scheduled run exits quietly."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -456,12 +828,10 @@ class FileLock:
     def __enter__(self) -> "FileLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = self.path.open("a+", encoding="utf-8")
-        try:
-            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+        if not _acquire_lock(self._fh):
             self._fh.close()
             self._fh = None
-            raise RoleLensError("Another RoleLens run is already active") from exc
+            raise RoleLensError("Another RoleLens run is already active")
         self._fh.seek(0)
         self._fh.truncate()
         self._fh.write(str(os.getpid()))
@@ -470,12 +840,22 @@ class FileLock:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         if self._fh is not None:
-            with contextlib.suppress(OSError):
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            _release_lock(self._fh)
             self._fh.close()
+            self._fh = None
+
+
+class HttpStatusError(RemoteAPIError):
+    """A non-retryable HTTP answer, with its status kept for the caller."""
+
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class HttpClient:
+    """Bounded retries over urllib, for every public API RoleLens reads."""
+
     def __init__(self, *, retries: int, user_agent: str) -> None:
         self.retries = retries
         self.user_agent = user_agent
@@ -488,7 +868,8 @@ class HttpClient:
         headers: Mapping[str, str] | None = None,
         payload: Mapping[str, Any] | None = None,
         timeout: int = 30,
-    ) -> dict[str, Any]:
+        expect: type = dict,
+    ) -> Any:
         final_headers = {
             "Accept": "application/json",
             "User-Agent": self.user_agent,
@@ -499,35 +880,55 @@ class HttpClient:
             data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             final_headers.setdefault("Content-Type", "application/json")
 
+        def parse(body: bytes) -> Any:
+            if not body:
+                return expect()
+            parsed = json.loads(body.decode("utf-8"))
+            # JobStream and some career sites answer with an array; most endpoints with an object.
+            if not isinstance(parsed, expect):
+                raise RemoteAPIError(f"Expected JSON {expect.__name__} from {redact_url(url)}")
+            return parsed
+
+        return self._request(method, url, final_headers, data, timeout, parse)
+
+    def fetch(self, url: str, *, timeout: int = 30, accept: str = "*/*") -> bytes:
+        """GET a document as bytes, for RSS feeds and server-rendered pages."""
+        headers = {"Accept": accept, "User-Agent": self.user_agent}
+        return self._request("GET", url, headers, None, timeout, lambda body: body)
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str],
+        data: bytes | None,
+        timeout: int,
+        parse: Callable[[bytes], Any],
+    ) -> Any:
         last_error: BaseException | None = None
         for attempt in range(self.retries + 1):
-            request = urllib.request.Request(url, data=data, headers=final_headers, method=method)
+            request = urllib.request.Request(url, data=data, headers=dict(headers), method=method)
             try:
                 with urllib.request.urlopen(request, timeout=timeout) as response:
-                    body = response.read()
-                    if not body:
-                        return {}
-                    parsed = json.loads(body.decode("utf-8"))
-                    if not isinstance(parsed, dict):
-                        raise RemoteAPIError(f"Expected JSON object from {redact_url(url)}")
-                    return parsed
+                    return parse(response.read())
             except urllib.error.HTTPError as exc:
                 last_error = exc
-                body = exc.read().decode("utf-8", errors="replace")[:1500]
+                body = exc.read().decode("utf-8", errors="replace")[:1500] if exc.fp is not None else ""
                 if exc.code not in RETRYABLE_HTTP_CODES or attempt >= self.retries:
                     message = f"HTTP {exc.code} from {redact_url(url)}: {body or exc.reason}"
                     if exc.code == 429:
                         raise RateLimitError(message) from exc
-                    raise RemoteAPIError(message) from exc
-                delay = retry_delay(attempt, exc.headers.get("Retry-After"))
+                    raise HttpStatusError(message, status=exc.code) from exc
+                delay = retry_delay(attempt, exc.headers.get("Retry-After") if exc.headers else None)
                 LOG.warning("HTTP %s, retrying in %.1fs: %s", exc.code, delay, redact_url(url))
                 time.sleep(delay)
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError,
+                    UnicodeDecodeError) as exc:
                 last_error = exc
                 if attempt >= self.retries:
                     raise RemoteAPIError(f"Request failed: {redact_url(url)}: {exc}") from exc
                 delay = retry_delay(attempt, None)
-                LOG.warning("Network/JSON error, retrying in %.1fs: %s", delay, exc)
+                LOG.warning("Network/decoding error, retrying in %.1fs: %s", delay, exc)
                 time.sleep(delay)
         raise RemoteAPIError(f"Request failed: {last_error}")
 
@@ -542,7 +943,11 @@ class Database:
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.execute("PRAGMA busy_timeout = 5000")
-        self._migrate()
+        try:
+            self._migrate()
+        except BaseException:
+            self.conn.close()
+            raise
 
     def close(self) -> None:
         self.conn.close()
@@ -613,8 +1018,7 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_evaluations_notify
                     ON evaluations(decision, opportunity_score DESC, evaluated_at DESC);
 
-                -- Repost bookkeeping. Additive and never deletes a source job,
-                -- so an older build simply ignores this table.
+                -- Repost bookkeeping. Additive and never deletes a source job.
                 CREATE TABLE IF NOT EXISTS job_fingerprints (
                     job_id INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
                     fingerprint TEXT NOT NULL,
@@ -639,13 +1043,23 @@ class Database:
                     stats_json TEXT NOT NULL,
                     error TEXT
                 );
+
+                -- One embedding per distinct profile, so the profile is embedded
+                -- once rather than on every run.
+                CREATE TABLE IF NOT EXISTS profile_embeddings (
+                    profile_key TEXT PRIMARY KEY,
+                    model TEXT NOT NULL,
+                    facet_names_json TEXT NOT NULL,
+                    vectors BLOB NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             existing = self.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
             existing_version = existing["value"] if existing is not None else None
-            if existing_version not in {None, "1", SCHEMA_VERSION}:
+            if existing_version not in {None, "1", "2", SCHEMA_VERSION}:
                 raise ConfigurationError(
-                    f"Unsupported database schema {existing_version}; expected 1 or {SCHEMA_VERSION}"
+                    f"Unsupported database schema {existing_version}; expected 1 to {SCHEMA_VERSION}"
                 )
 
             # Schema v2 adds a durable content-change timestamp. Existing v1 rows
@@ -661,6 +1075,16 @@ class Database:
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_content_changed "
                 "ON jobs(content_changed_at DESC, discovery_score DESC)"
+            )
+
+            # Schema v3 adds ranking. Every column is nullable: a row without
+            # them is simply unranked, and never enters the evaluation queue.
+            for name, kind in RANKING_COLUMNS:
+                if name not in columns:
+                    self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_selection "
+                "ON jobs(selection_state, rank_percentile)"
             )
 
             if existing is None:
@@ -687,7 +1111,7 @@ class Database:
                 (iso_now(), status_value, json.dumps(dataclasses.asdict(stats), sort_keys=True), error, run_id),
             )
 
-    def upsert_job(self, job: JobRecord) -> None:
+    def upsert_job(self, job: JobRecord, *, source: str = "platsbanken") -> None:
         now = iso_now()
         with self.conn:
             self.conn.execute(
@@ -722,10 +1146,16 @@ class Database:
                         WHEN jobs.content_hash <> excluded.content_hash
                         THEN excluded.content_changed_at
                         ELSE jobs.content_changed_at
+                    END,
+                    -- An edited ad has to earn its place in the queue again.
+                    selection_state=CASE
+                        WHEN jobs.content_hash <> excluded.content_hash
+                        THEN NULL
+                        ELSE jobs.selection_state
                     END
                 """,
                 (
-                    "platsbanken",
+                    source,
                     job.source_job_id,
                     job.content_hash,
                     job.title,
@@ -749,6 +1179,17 @@ class Database:
                     now,
                 ),
             )
+
+    def content_hashes(self, source: str, *, prefix: str = "") -> dict[str, str]:
+        """source_job_id -> content hash for one source, optionally one id prefix."""
+        pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        return {
+            str(row["source_job_id"]): str(row["content_hash"])
+            for row in self.conn.execute(
+                "SELECT source_job_id, content_hash FROM jobs WHERE source=? AND source_job_id LIKE ? ESCAPE '\\'",
+                (source, pattern),
+            )
+        }
 
     def get_meta(self, key: str) -> str | None:
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
@@ -794,8 +1235,10 @@ class Database:
                  AND e.content_hash = j.content_hash
                  AND e.profile_version = ?
                 WHERE e.id IS NULL
+                  AND j.selection_state = 'selected'
                   {live_clause}
                 ORDER BY
+                    COALESCE(j.rank_percentile, 1.0) ASC,
                     j.discovery_score DESC,
                     COALESCE(j.published_at, j.first_seen_at) DESC,
                     j.id DESC
@@ -832,6 +1275,7 @@ class Database:
                  AND e.content_hash = j.content_hash
                  AND e.profile_version = ?
                 WHERE e.id IS NULL
+                  AND j.selection_state = 'selected'
                   AND j.content_changed_at < ?
                   AND (j.application_deadline IS NULL
                        OR j.application_deadline = ''
@@ -869,6 +1313,7 @@ class Database:
              AND e.content_hash = j.content_hash
              AND e.profile_version = ?
             WHERE j.content_changed_at < ?
+              AND j.selection_state = 'selected'
             """,
             (profile_version, live_since),
         ).fetchall()
@@ -939,11 +1384,115 @@ class Database:
              AND e.content_hash=j.content_hash
              AND e.profile_version=?
             WHERE e.id IS NULL
+              AND j.selection_state = 'selected'
               {live_clause}
             """,
             tuple(params),
         ).fetchone()
         return int(row[0])
+
+    def unranked_jobs(self, ranking_key: str, *, since: str, limit: int) -> list[sqlite3.Row]:
+        """Ads in the ranking window that need a rank.
+
+        New or edited ads, ads ranked under another profile or vocabulary, ads
+        interrupted before selection, and ads passed over while embeddings were
+        unavailable. Newest first, so a capped run always covers the latest.
+        """
+        return list(
+            self.conn.execute(
+                """
+                SELECT id, source_job_id, content_hash, title, description
+                FROM jobs
+                WHERE content_changed_at >= ?
+                  AND (selection_state IS NULL
+                       OR rank_content_hash IS NOT content_hash
+                       OR rank_profile_key IS NOT ?
+                       OR (selection_state = 'not_selected' AND embedding_score IS NULL))
+                ORDER BY content_changed_at DESC, id DESC
+                LIMIT ?
+                """,
+                (since, ranking_key, limit),
+            )
+        )
+
+    def save_rank_scores(
+        self,
+        ranking_key: str,
+        scores: Sequence[tuple[int, str, float, float | None, float | None, str | None]],
+    ) -> None:
+        """Store (job id, content hash, vocabulary, embedding and enrichment
+        scores, requested concepts as JSON).
+
+        The old decision is cleared in the same step, so a run interrupted
+        before selection leaves the ads unranked rather than stale.
+        """
+        now = iso_now()
+        with self.conn:
+            self.conn.executemany(
+                "UPDATE jobs SET rank_content_hash=?, rank_profile_key=?, vocabulary_score=?, "
+                "embedding_score=?, enrichment_score=?, enrichment_json=?, ranked_at=?, "
+                "rank_percentile=NULL, selection_state=NULL, selection_reason=NULL "
+                "WHERE id=?",
+                [
+                    (content_hash, ranking_key, vocabulary, embedding, enrichment, concepts, now, job_id)
+                    for job_id, content_hash, vocabulary, embedding, enrichment, concepts in scores
+                ],
+            )
+
+    def ranking_reference(self, ranking_key: str, *, since: str) -> list[sqlite3.Row]:
+        """Every ad in the window ranked the current way: the pool a percentile is taken over."""
+        return list(
+            self.conn.execute(
+                "SELECT id, vocabulary_score, embedding_score, enrichment_score FROM jobs "
+                "WHERE content_changed_at >= ? AND rank_profile_key = ? "
+                "AND rank_content_hash = content_hash AND vocabulary_score IS NOT NULL",
+                (since, ranking_key),
+            )
+        )
+
+    def save_selection(self, decisions: Sequence[tuple[int, float, str, str | None]]) -> None:
+        """Store (job id, top percentile, 'selected' or 'not_selected', reason).
+
+        The reason says why a selected ad is read: 'rank', 'explore' or 'fail_open'.
+        """
+        with self.conn:
+            self.conn.executemany(
+                "UPDATE jobs SET rank_percentile=?, selection_state=?, selection_reason=? WHERE id=?",
+                [(percentile, state, reason, job_id) for job_id, percentile, state, reason in decisions],
+            )
+
+    def get_profile_embedding(self, profile_key: str) -> list[array.array] | None:
+        row = self.conn.execute(
+            "SELECT facet_names_json, vectors FROM profile_embeddings WHERE profile_key=?",
+            (profile_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        flat = array.array("f")
+        flat.frombytes(row["vectors"])
+        count = len(json.loads(row["facet_names_json"]))
+        if not count or len(flat) != count * EMBEDDING_DIMENSIONS:
+            return None
+        return [flat[i * EMBEDDING_DIMENSIONS:(i + 1) * EMBEDDING_DIMENSIONS] for i in range(count)]
+
+    def save_profile_embedding(
+        self,
+        profile_key: str,
+        model: str,
+        names: Sequence[str],
+        vectors: Sequence[array.array],
+    ) -> None:
+        flat = array.array("f")
+        for vector in vectors:
+            flat.extend(vector)
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO profile_embeddings(profile_key, model, facet_names_json, vectors, created_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(profile_key) DO UPDATE SET "
+                "model=excluded.model, facet_names_json=excluded.facet_names_json, "
+                "vectors=excluded.vectors, created_at=excluded.created_at",
+                (profile_key, model, json.dumps(list(names), ensure_ascii=False), flat.tobytes(), iso_now()),
+            )
 
     def save_evaluation(
         self,
@@ -1085,6 +1634,19 @@ class Database:
                 [(value, now) for value in evaluation_ids],
             )
 
+    def month_to_date_cost_usd(self, now: dt.datetime | None = None) -> float:
+        """Estimated provider spend of every run recorded since the first of this UTC month."""
+        month_start = (now or dt.datetime.now(UTC)).strftime("%Y-%m-01")
+        total = 0.0
+        for row in self.conn.execute("SELECT stats_json FROM runs WHERE started_at >= ?", (month_start,)):
+            try:
+                stats = json.loads(row["stats_json"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            if isinstance(stats, dict):
+                total += estimated_run_cost_usd(stats)
+        return total
+
     def status(self, profile_version: str | None = None) -> dict[str, Any]:
         def scalar(sql: str) -> int:
             return int(self.conn.execute(sql).fetchone()[0])
@@ -1092,9 +1654,17 @@ class Database:
         live_since = self.get_meta("live_since")
         result: dict[str, Any] = {
             "jobs": scalar("SELECT COUNT(*) FROM jobs"),
+            "jobs_by_source": {
+                str(row[0]): int(row[1])
+                for row in self.conn.execute("SELECT source, COUNT(*) FROM jobs GROUP BY source ORDER BY source")
+            },
             "evaluations": scalar("SELECT COUNT(*) FROM evaluations"),
             "notifications_emitted": scalar("SELECT COUNT(*) FROM notifications"),
             "runs": scalar("SELECT COUNT(*) FROM runs"),
+            "jobs_selected": scalar("SELECT COUNT(*) FROM jobs WHERE selection_state='selected'"),
+            "jobs_not_selected": scalar("SELECT COUNT(*) FROM jobs WHERE selection_state='not_selected'"),
+            "jobs_unranked": scalar("SELECT COUNT(*) FROM jobs WHERE selection_state IS NULL"),
+            "month_to_date_cost_usd": round(self.month_to_date_cost_usd(), 2),
             "mode": "live" if live_since else "bootstrap",
             "live_since": live_since,
         }
@@ -1108,29 +1678,55 @@ class Database:
         return result
 
 
+class JobStreamClient:
+    """Arbetsförmedlingen JobStream: every Platsbanken ad added, changed or
+    unpublished since a timestamp, in one request, with no API key.
+
+    Keyword searches only fetch the ads whose words someone thought to search
+    for. The stream fetches all of them and lets ranking decide.
+    """
+
+    def __init__(self, http: HttpClient, settings: Settings) -> None:
+        self.http = http
+        self.settings = settings
+
+    def stream(self, updated_after: dt.datetime) -> list[Any]:
+        stamp = updated_after.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+        return self.http.json_request(
+            "GET",
+            f"{JOBSTREAM_BASE_URL}/v2/stream?updated-after={stamp}",
+            timeout=self.settings.jobstream_timeout_seconds,
+            expect=list,
+        )
+
+
 class JobSearchClient:
+    """Arbetsförmedlingen JobSearch: open Platsbanken ads matching a query.
+
+    JobStream only replays recent changes, so keyword queries are how a fresh
+    installation reaches ads that were published before it started.
+    """
+
     def __init__(self, http: HttpClient, settings: Settings) -> None:
         self.http = http
         self.settings = settings
 
     def search(self, query: str) -> list[dict[str, Any]]:
         params = urllib.parse.urlencode({"q": query, "limit": self.settings.search_limit})
-        url = f"{JOBSEARCH_BASE_URL}/search?{params}"
         result = self.http.json_request(
             "GET",
-            url,
+            f"{JOBSEARCH_BASE_URL}/search?{params}",
             timeout=self.settings.jobsearch_timeout_seconds,
         )
         hits = result.get("hits", [])
         if not isinstance(hits, list):
             raise RemoteAPIError("JobSearch response did not contain a hits array")
-        return [x for x in hits if isinstance(x, dict)]
+        return [hit for hit in hits if isinstance(hit, dict)]
 
     def ad(self, ad_id: str) -> dict[str, Any]:
-        quoted = urllib.parse.quote(ad_id, safe="")
         return self.http.json_request(
             "GET",
-            f"{JOBSEARCH_BASE_URL}/ad/{quoted}",
+            f"{JOBSEARCH_BASE_URL}/ad/{urllib.parse.quote(ad_id, safe='')}",
             timeout=self.settings.jobsearch_timeout_seconds,
         )
 
@@ -1168,7 +1764,10 @@ def citizenship_prompt_clause(profile: Mapping[str, Any] | None) -> str:
     constraints = profile.get("constraints") if isinstance(profile, Mapping) else None
     if not isinstance(constraints, Mapping):
         return ""
-    read = lambda key: clean_text(constraints.get(key)).casefold()
+
+    def read(key: str) -> str:
+        return clean_text(constraints.get(key)).casefold()
+
     if read("swedish_citizenship") not in {"yes", "no"}:
         return ""
     if read("swedish_citizenship") == "yes":
@@ -1188,11 +1787,11 @@ def citizenship_prompt_clause(profile: Mapping[str, Any] | None) -> str:
     )
     if read("work_permit") == "yes":
         clause += (
-            "The candidate does hold a long-term visa with a valid work permit and needs no employer "
-            "sponsorship and no relocation package. So a requirement phrased as the right to work, existing "
-            "work authorisation, a valid work permit, or an inability of the employer to sponsor a visa is "
-            "MET and is never a blocker, even when the same sentence also mentions citizenship. Read which "
-            "of the two the advertisement actually requires before deciding. "
+            "The candidate does hold a valid work permit and needs no employer sponsorship and no relocation "
+            "package. So a requirement phrased as the right to work, existing work authorisation, a valid work "
+            "permit, or an inability of the employer to sponsor a visa is MET and is never a blocker, even when "
+            "the same sentence also mentions citizenship. Read which of the two the advertisement actually "
+            "requires before deciding. "
         )
     return clause
 
@@ -1212,6 +1811,18 @@ def semantic_system_prompt(
         "Judge explicit mandatory fluent/professional/advanced Swedish against the candidate level stated above; preferred or optional "
         "Swedish is never a blocker. Ordinary background/security screening does not imply citizenship or clearance eligibility. "
         "If citizenship or security eligibility is explicitly required and candidate evidence does not resolve it, preserve UNKNOWN. "
+        "When the candidate object carries a knowledge_catalogue, it is the authoritative record of the candidate's "
+        "experience, education and skill levels: check every requirement against it, treat a skill it marks "
+        "not_evidenced as absent, and take seniority from its dated roles, never from a title. The application "
+        "settles total years of experience, senior titles and student roles from those dates itself. Years demanded "
+        "in one named field need your reading: when an advertisement asks for years in a specific discipline, role or "
+        "technology (for example \"2+ years in QA and software testing\" or \"3+ years of professional Python "
+        "backend\"), add a must_have_assessment row whose requirement begins with \"Years in field:\" followed by "
+        "that demand. A demand for years of experience, software development or programming in general, or for "
+        "several years without a named field, is total experience and gets no such row. Mark the row met when the "
+        "catalogue's dated roles show that same kind of work for those years, partial when related or shorter work "
+        "covers part of it, and unmet when the catalogue shows no such work. Do not lower career_fit or "
+        "opportunity_score and do not add a blocker because of this row; the application applies its effect. "
         "Unknown years of experience are unknown or partial, not automatically unmet. Founder/CTO titles are not proof of "
         "staff-level seniority. "
         "Record a hard blocker when the centre of the job is work the candidate has no evidence for: a named primary "
@@ -1264,6 +1875,13 @@ def provider_json_request(
             if retry_after:
                 message += f" (Retry-After: {retry_after})"
             raise TemporaryProviderError(provider, message, status=exc.code) from exc
+        body_text = ""
+        if exc.code == 400:
+            # Google answers an invalid API key with 400, not 401.
+            with contextlib.suppress(Exception):
+                body_text = exc.read(4000).decode("utf-8", errors="replace")
+        if exc.code in ACCESS_REFUSED_HTTP_CODES or "API key not valid" in body_text or "API_KEY_INVALID" in body_text:
+            raise ProviderAccessError(provider, message, status=exc.code) from exc
         raise RemoteAPIError(message) from exc
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
         raise TemporaryProviderError(provider, f"{provider} transport failure: {type(exc).__name__}") from exc
@@ -1350,6 +1968,8 @@ def parse_provider_evaluations(
     usage: dict[str, int],
     swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL,
     eligibility: Mapping[str, str] | None = None,
+    experience_years: float | None = None,
+    exclude_student_roles: bool = False,
 ) -> ProviderBatchResult:
     expected = {str(row["source_job_id"]): row for row in jobs}
     expected_ids = set(expected)
@@ -1391,7 +2011,8 @@ def parse_provider_evaluations(
             continue
         try:
             accepted[item_id] = validate_evaluation(
-                item, job=expected[item_id], swedish=swedish, eligibility=eligibility)
+                item, job=expected[item_id], swedish=swedish, eligibility=eligibility,
+                experience_years=experience_years, exclude_student_roles=exclude_student_roles)
         except RemoteAPIError as exc:
             errors.append(f"{item_id}: {compact_sentence(exc, 140)}")
     if unknown_ids:
@@ -1408,7 +2029,7 @@ def parse_provider_evaluations(
         usage=usage,
         error="; ".join(errors) if errors else None,
         # The envelope parsed, so anything left over is a completeness gap. That
-        # is a normal Gemini quirk and must never be read as a provider failure.
+        # is a normal quirk of constrained generation, never a provider failure.
         error_kind="completeness" if errors else None,
     )
 
@@ -1432,6 +2053,9 @@ class ProviderMatcher:
         self.swedish = candidate_language_level(matcher_profile, "swedish")
         # Likewise eligibility: unstated stays UNKNOWN, stated is allowed to decide.
         self.eligibility = candidate_eligibility(matcher_profile)
+        # And seniority: counted from the knowledge catalogue's dated roles, when supplied.
+        self.experience_years = catalogue_experience_years(matcher_profile.get("knowledge_catalogue"))
+        self.exclude_student_roles = bool(getattr(settings, "exclude_student_roles", False))
         if provider == PRIMARY_PROVIDER:
             self.model = secrets.get("VERTEX_GEMINI_MODEL", "")
             self.api_key = secrets.get("VERTEX_GEMINI_API_KEY", "")
@@ -1461,7 +2085,7 @@ class ProviderMatcher:
                 "systemInstruction": {"parts": [{"text": system_prompt}]},
                 "contents": [{"role": "user", "parts": [{"text": json.dumps(user_payload, ensure_ascii=False, separators=(",", ":"))}]}],
                 "generationConfig": {
-                    "maxOutputTokens": 12_000,
+                    "maxOutputTokens": JUDGE_MAX_OUTPUT_TOKENS,
                     "responseMimeType": "application/json",
                     "responseJsonSchema": evaluation_schema(),
                     "thinkingConfig": {"thinkingLevel": "MEDIUM"},
@@ -1481,7 +2105,7 @@ class ProviderMatcher:
                     "json_schema": {"name": "career_job_evaluations", "strict": True, "schema": evaluation_schema()},
                 },
                 "reasoning_effort": "low",
-                "max_completion_tokens": 12_000,
+                "max_completion_tokens": JUDGE_MAX_OUTPUT_TOKENS,
             }
             headers = {"api-key": self.api_key}
 
@@ -1503,10 +2127,16 @@ class ProviderMatcher:
 
         result = parse_provider_evaluations(
             content, jobs, provider=self.provider, model=self.model, usage=usage,
-            swedish=self.swedish, eligibility=self.eligibility
+            swedish=self.swedish, eligibility=self.eligibility,
+            experience_years=self.experience_years, exclude_student_roles=self.exclude_student_roles,
         )
         archive_model_response(self.settings, self.provider, content, failure=bool(result.error))
         return result
+
+
+def describe_provider_failure(error: TemporaryProviderError | ProviderAccessError) -> str:
+    kind = "refused access" if isinstance(error, ProviderAccessError) else "temporary failure"
+    return f"{kind} ({error.reason})"
 
 
 def evaluate_with_fallback(
@@ -1516,26 +2146,31 @@ def evaluate_with_fallback(
     *,
     stats: "RunStats | None" = None,
 ) -> tuple[ProviderBatchResult, bool]:
-    """One primary call, and at most one fallback call for temporary transport failure."""
+    """One primary call, and at most one fallback call.
+
+    The fallback answers when the primary is unreachable or temporarily failing,
+    and also when it refuses this account outright - a bad key, billing or credit
+    switched off - because the other provider can still judge the jobs.
+    """
     try:
         return primary.evaluate(jobs), False
-    except TemporaryProviderError as primary_error:
+    except (TemporaryProviderError, ProviderAccessError) as primary_error:
         # Log the cause, not just the fact. A rate limit and a socket timeout
-        # need different responses, and they used to be indistinguishable.
+        # need different responses.
         LOG.warning(
-            "%s temporarily unavailable (%s); trying %s once",
-            primary.provider, primary_error, fallback.provider,
+            "%s %s: %s; trying %s once",
+            primary.provider, describe_provider_failure(primary_error), primary_error, fallback.provider,
         )
         if stats is not None:
             key = primary_error.reason
             stats.fallback_reasons[key] = stats.fallback_reasons.get(key, 0) + 1
         try:
             return fallback.evaluate(jobs), True
-        except TemporaryProviderError as fallback_error:
+        except (TemporaryProviderError, ProviderAccessError) as fallback_error:
             expected_ids = frozenset(str(row["source_job_id"]) for row in jobs)
             error = (
-                f"{primary.provider} temporary failure ({primary_error.reason}); "
-                f"{fallback.provider} temporary failure ({fallback_error.reason})"
+                f"{primary.provider} {describe_provider_failure(primary_error)}; "
+                f"{fallback.provider} {describe_provider_failure(fallback_error)}"
             )
             LOG.warning("%s: %s / %s", error, primary_error, fallback_error)
             if stats is not None:
@@ -1550,6 +2185,84 @@ def evaluate_with_fallback(
                 error=error,
                 error_kind="transport",
             ), True
+
+
+# A second judgement near the card line. Two identical judge runs over the same
+# delivered cards disagreed on card or no card for about one in seven of them,
+# every one with an opportunity score between 55 and 75. An ad whose first score
+# lands in this band is judged again and decided on the mean of both.
+SECOND_JUDGEMENT_BAND = (52, 77)
+
+
+def is_hard_blocker(blocker: Mapping[str, str]) -> bool:
+    return clean_text(blocker.get("type")).casefold() == "hard"
+
+
+def combine_judgements(first: Evaluation, second: Evaluation) -> Evaluation:
+    """One decision from two judgements of the same ad.
+
+    The scores are averaged, which halves the run-to-run noise without leaning
+    either way. A hard blocker counts only when both judgements found one, so a
+    blocker one run imagined cannot erase a match the other run saw.
+    """
+    career_fit = round((first.career_fit + second.career_fit) / 2)
+    opportunity = round((first.opportunity_score + second.opportunity_score) / 2)
+    first_hard = any(is_hard_blocker(b) for b in first.blockers)
+    second_hard = any(is_hard_blocker(b) for b in second.blockers)
+    blockers = second.blockers if first_hard and not second_hard else first.blockers
+    decision = classify_decision(career_fit, opportunity, blockers)
+    keeps_card = first.raw.get(FIELD_YEARS_KEEP_CARD) or second.raw.get(FIELD_YEARS_KEEP_CARD)
+    if keeps_card and not decision.startswith("notify"):
+        decision = "notify_stretch"
+    raw = dict(first.raw)
+    raw["second_judgement"] = {
+        "first": {"career_fit": first.career_fit, "opportunity_score": first.opportunity_score,
+                  "decision": first.decision},
+        "second": {"career_fit": second.career_fit, "opportunity_score": second.opportunity_score,
+                   "decision": second.decision},
+    }
+    return dataclasses.replace(
+        first, career_fit=career_fit, opportunity_score=opportunity,
+        confidence=round((first.confidence + second.confidence) / 2, 3),
+        blockers=blockers, decision=decision, raw=raw,
+    )
+
+
+def judge_near_the_line_again(
+    primary: "ProviderMatcher",
+    fallback: "ProviderMatcher",
+    evaluations: Sequence[Evaluation],
+    rows_by_source_id: Mapping[str, sqlite3.Row],
+    *,
+    stats: RunStats,
+) -> list[Evaluation]:
+    """Judge once more the ads scored near the card line, and merge the two.
+
+    An ad the second call does not answer keeps its first judgement.
+    """
+    low, high = SECOND_JUDGEMENT_BAND
+    near = [
+        evaluation for evaluation in evaluations
+        if low <= evaluation.opportunity_score <= high and evaluation.source_job_id in rows_by_source_id
+    ]
+    if not near:
+        return list(evaluations)
+    again, used_fallback = evaluate_with_fallback(
+        primary, fallback, [rows_by_source_id[evaluation.source_job_id] for evaluation in near], stats=stats)
+    stats.fallback_calls += int(used_fallback)
+    add_provider_usage(stats, again.usage)
+    second = {evaluation.source_job_id: evaluation for evaluation in again.evaluations}
+    merged: dict[str, Evaluation] = {}
+    for first in near:
+        other = second.get(first.source_job_id)
+        if other is None:
+            continue
+        combined = combine_judgements(first, other)
+        stats.second_judgements += 1
+        if combined.decision.startswith("notify") != first.decision.startswith("notify"):
+            stats.second_judgement_changes += 1
+        merged[first.source_job_id] = combined
+    return [merged.get(evaluation.source_job_id, evaluation) for evaluation in evaluations]
 
 
 @dataclasses.dataclass
@@ -1598,7 +2311,10 @@ def run_batch_pass(
         add_provider_usage(stats, result.usage)
 
         by_source_id = {str(row["source_job_id"]): row for row in batch}
-        for evaluation in result.evaluations:
+        evaluations = list(result.evaluations)
+        if time.monotonic() + reserve_seconds <= deadline:
+            evaluations = judge_near_the_line_again(primary, fallback, evaluations, by_source_id, stats=stats)
+        for evaluation in evaluations:
             row = by_source_id.get(evaluation.source_job_id)
             if row is None:
                 continue
@@ -1630,6 +2346,292 @@ def run_batch_pass(
     return outcome
 
 
+# ---------------------------------------------------------------------------
+# The first read.
+#
+# A cheap model reads what the rules let through, with a prompt a fraction of
+# the judge's size: a short candidate card, the rules, and one short line back
+# per ad. A confident rejection is stored like a judgement and the ad is done.
+# Every ad it passes, every ad it is unsure about and every ad it fails to answer
+# for goes to the judge, so the first read can save money but never cost a match.
+# ---------------------------------------------------------------------------
+def triage_system_prompt(exclude_student_roles: bool = True) -> str:
+    """The first-read instructions. Everything about the candidate is in the card."""
+    student = ", or it is an internship, thesis or student job" if exclude_student_roles else ""
+    return (
+        "You pre-screen Swedish job ads for one candidate. A stronger model fully judges every ad you pass, so reject "
+        "only ads that are clearly not worth judging, and pass whenever you are unsure. Read Swedish and English.\n"
+        "Reject when the centre of the work is a profession or specialist discipline outside the candidate's target "
+        "roles and capabilities, including anything the candidate card lists under 'Not a fit' or 'No evidence of', "
+        "or when the role is built on a primary language, platform or discipline the candidate has no evidence for.\n"
+        "Reject when the ad makes mandatory what the candidate cannot meet: a people-manager or head role, clearly more "
+        "years of experience than the card states, a citizenship, residence or clearance status the candidate lacks, "
+        f"or a Swedish level above the candidate's{student}.\n"
+        "Pass everything whose centre matches the candidate's target roles or strong capabilities, however unfamiliar "
+        "the title.\n"
+        "Answer every ad exactly once with its id, a reason of at most eight words, fit 0-100 for how well the work "
+        "suits the candidate, and the verdict pass or reject."
+    )
+
+
+TRIAGE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "ads": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "fit": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "verdict": {"type": "string", "enum": ["pass", "reject"]},
+                },
+                "required": ["id", "reason", "fit", "verdict"],
+            },
+        },
+    },
+    "required": ["ads"],
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class TriageVerdict:
+    source_job_id: str
+    passed: bool
+    fit: int
+    reason: str
+
+
+@dataclasses.dataclass(frozen=True)
+class TriageResult:
+    verdicts: dict[str, TriageVerdict]
+    usage: dict[str, int]
+    error: str | None = None
+
+
+def triage_candidate_card(profile: Mapping[str, Any]) -> str:
+    """The candidate in a few hundred tokens: what a first read needs and nothing more."""
+    def joined(key: str, separator: str = "; ") -> str:
+        value = profile.get(key)
+        if not isinstance(value, list):
+            return ""
+        return separator.join(clean_text(item) for item in value if clean_text(item))
+
+    catalogue = profile.get("knowledge_catalogue")
+    catalogue = catalogue if isinstance(catalogue, Mapping) else {}
+    years = catalogue_experience_years(catalogue)
+    groups = catalogue.get("capability_catalogue")
+    lacks = [
+        clean_text(item.get("skill"))
+        for group in (groups.values() if isinstance(groups, Mapping) else [])
+        if isinstance(group, list)
+        for item in group
+        if isinstance(item, Mapping) and clean_text(item.get("level")).startswith(("not_", "limited_or_not"))
+    ]
+    constraints = profile.get("constraints") if isinstance(profile.get("constraints"), Mapping) else {}
+    eligibility = candidate_eligibility(profile) or {}
+    barred = barred_statuses(eligibility)
+    permit = "Holds a Swedish work permit; " if eligibility.get("work_permit") == "yes" else ""
+    lines = [
+        f"Core: {clean_text(profile.get('candidate_core'))}",
+        f"Professional experience: {years:g} years" if years is not None else "",
+        f"Strong: {joined('strong_capabilities')}",
+        f"Also: {joined('secondary_capabilities')}",
+        f"Tech: {joined('technology_evidence', ', ')}",
+        f"Target roles: {joined('role_families_to_recognize_semantically')}",
+        f"Not a fit: {joined('out_of_scope_work')}",
+        f"No evidence of: {', '.join(lacks)}" if lacks else "",
+        f"Education: {clean_text(profile.get('education_signal'))}",
+        f"Swedish: {clean_text(constraints.get('swedish'))}",
+        f"{permit}lacks {', '.join(barred)}" if barred else "",
+    ]
+    return "\n".join(line for line in lines if line and not line.endswith(": "))
+
+
+def triage_ad_text(row: Mapping[str, Any]) -> str:
+    """One ad for the first read: a header line, then the head and tail of the text."""
+    location = ", ".join(x for x in (row["municipality"], row["region"]) if x) or "location unspecified"
+    header = " | ".join((str(row["source_job_id"]), clean_text(row["title"]), clean_text(row["company"]), location))
+    body = " ".join(clean_text(row["description"]).split())
+    return f"{header}\n{truncate_middle(body, TRIAGE_DESCRIPTION_CHARS)}"
+
+
+def parse_triage_verdicts(
+    content: str, rows: Sequence[Mapping[str, Any]]
+) -> tuple[dict[str, TriageVerdict], str | None]:
+    """Usable verdicts by source_job_id, and what was wrong with the rest."""
+    expected = {str(row["source_job_id"]) for row in rows}
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        return {}, f"invalid JSON: {compact_sentence(exc, 160)}"
+    items = parsed.get("ads") if isinstance(parsed, dict) else None
+    if not isinstance(items, list):
+        return {}, "response missing ads array"
+    verdicts: dict[str, TriageVerdict] = {}
+    repeated: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        ad_id = clean_text(item.get("id"))
+        verdict = clean_text(item.get("verdict")).casefold()
+        fit = item.get("fit")
+        if ad_id not in expected or verdict not in {"pass", "reject"}:
+            continue
+        if isinstance(fit, bool) or not isinstance(fit, int) or not 0 <= fit <= 100:
+            continue
+        if ad_id in verdicts or ad_id in repeated:
+            # Two answers for one ad cancel out, and the judge reads it.
+            verdicts.pop(ad_id, None)
+            repeated.add(ad_id)
+            continue
+        verdicts[ad_id] = TriageVerdict(ad_id, verdict == "pass", fit, compact_sentence(item.get("reason"), 160))
+    missing = len(expected) - len(verdicts)
+    return verdicts, (f"no usable verdict for {missing} of {len(expected)} ads" if missing else None)
+
+
+class TriageClient:
+    """The first read, on Vertex Gemini with the judge's key."""
+
+    def __init__(self, settings: Settings, secrets: Mapping[str, str], matcher_profile: Mapping[str, Any]) -> None:
+        self.settings = settings
+        self.model = settings.triage_model
+        self.api_key = secrets.get("VERTEX_GEMINI_API_KEY", "")
+        if not self.model or not self.api_key:
+            raise ConfigurationError("The first read needs config.triage_model and VERTEX_GEMINI_API_KEY")
+        quoted_model = urllib.parse.quote(self.model, safe="")
+        self.url = f"{GEMINI_BASE_URL}/{quoted_model}:generateContent"
+        self.card = triage_candidate_card(matcher_profile)
+
+    def request_payload(self, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        ads = "\n\n".join(triage_ad_text(row) for row in rows)
+        text = f"CANDIDATE\n{self.card}\n\nADS, each opening with: id | title | employer | location\n\n{ads}"
+        return {
+            "systemInstruction": {"parts": [{"text": triage_system_prompt(self.settings.exclude_student_roles)}]},
+            "contents": [{"role": "user", "parts": [{"text": text}]}],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": TRIAGE_MAX_OUTPUT_TOKENS,
+                "responseMimeType": "application/json",
+                "responseJsonSchema": TRIAGE_SCHEMA,
+                "thinkingConfig": {"thinkingBudget": self.settings.triage_thinking_budget},
+            },
+        }
+
+    def read(self, rows: Sequence[Mapping[str, Any]]) -> TriageResult:
+        if not rows:
+            return TriageResult({}, empty_usage())
+        response = provider_json_request(
+            provider=PRIMARY_PROVIDER,
+            url=self.url,
+            headers={"x-goog-api-key": self.api_key},
+            payload=self.request_payload(rows),
+            timeout=self.settings.gateway_timeout_seconds,
+        )
+        try:
+            content, usage = extract_gemini_response(response)
+        except ModelOutputError as exc:
+            return TriageResult({}, {**empty_usage(), **exc.usage}, compact_sentence(exc, 300))
+        verdicts, error = parse_triage_verdicts(content, rows)
+        return TriageResult(verdicts, usage, error)
+
+
+def triage_settles(verdict: TriageVerdict) -> bool:
+    """Only a rejection well below a possible match stands without the judge."""
+    return not verdict.passed and verdict.fit < TRIAGE_SETTLE_BELOW_FIT
+
+
+def triage_evaluation(verdict: TriageVerdict, model: str) -> Evaluation:
+    """A settled first read, stored like a judgement so the ad is never read again."""
+    reason = verdict.reason or "clearly not a match"
+    return Evaluation(
+        source_job_id=verdict.source_job_id,
+        career_fit=verdict.fit,
+        opportunity_score=verdict.fit,
+        confidence=0.5,
+        actual_role="Settled by the first read",
+        why_fit=(),
+        candidate_evidence=(),
+        must_have_assessment=(),
+        gaps=(),
+        blockers=({"type": "strong", "reason": f"First read ({model}): {reason}"},),
+        language_risk="",
+        seniority_risk="",
+        location_note="",
+        decision="store_no_notify",
+        raw={"first_read": {"model": model, "verdict": "reject", "fit": verdict.fit, "reason": reason}},
+    )
+
+
+def run_triage_pass(
+    db: "Database",
+    client: "TriageClient",
+    rows: Sequence[sqlite3.Row],
+    *,
+    profile_version: str,
+    stats: RunStats,
+    deadline: float,
+    reserve_seconds: int,
+) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+    """Settle what the first read rejects with confidence; return (for the judge, deferred).
+
+    Fails open. A temporary failure sends that batch to the judge; a refusal, or
+    a second temporary failure in a row, sends the rest of the run.
+    """
+    batches = list(
+        iter_batches(
+            rows,
+            max_jobs=client.settings.triage_batch_size,
+            max_chars=client.settings.max_prompt_chars,
+            max_job_description_chars=TRIAGE_DESCRIPTION_CHARS,
+        )
+    )
+    to_judge: list[sqlite3.Row] = []
+    deferred: list[sqlite3.Row] = []
+    temporary_failures = 0
+    for index, batch in enumerate(batches):
+        if index and time.monotonic() + reserve_seconds > deadline:
+            deferred = [row for later in batches[index:] for row in later]
+            LOG.warning("Emergency runtime budget reached in the first read; %d job(s) left pending", len(deferred))
+            break
+        try:
+            result = client.read(batch)
+        except TemporaryProviderError as error:
+            temporary_failures += 1
+            LOG.warning("First read %s: %s; the judge reads this batch", describe_provider_failure(error), error)
+            if temporary_failures < 2:
+                to_judge.extend(batch)
+                continue
+            to_judge.extend(row for later in batches[index:] for row in later)
+            break
+        except RemoteAPIError as error:
+            stats.triage_failure = getattr(error, "reason", None) or type(error).__name__
+            LOG.warning("First read failed (%s): %s; the judge reads the rest of this run", stats.triage_failure, error)
+            to_judge.extend(row for later in batches[index:] for row in later)
+            break
+        temporary_failures = 0
+        stats.triage_calls += 1
+        stats.triage_prompt_tokens += int(result.usage.get("prompt_tokens") or 0)
+        stats.triage_completion_tokens += int(result.usage.get("completion_tokens") or 0)
+        stats.triage_reasoning_tokens += int(result.usage.get("reasoning_tokens") or 0)
+        if result.error:
+            LOG.info("First read, batch %d: %s", index + 1, result.error)
+        for row in batch:
+            verdict = result.verdicts.get(str(row["source_job_id"]))
+            if verdict is not None and triage_settles(verdict):
+                db.save_evaluation(
+                    row, triage_evaluation(verdict, client.model),
+                    profile_version=profile_version, model=f"{PRIMARY_PROVIDER}:{client.model}",
+                )
+                stats.triage_settled += 1
+                stats.evaluated += 1
+            else:
+                to_judge.append(row)
+    stats.triage_escalated += len(to_judge)
+    return to_judge, deferred
+
+
 def iso_now() -> str:
     return dt.datetime.now(UTC).isoformat(timespec="microseconds")
 
@@ -1644,6 +2646,7 @@ def retry_delay(attempt: int, retry_after: str | None) -> float:
 
 
 def redact_url(url: str) -> str:
+    """Scheme, host and path only: a query string can carry a credential."""
     parts = urllib.parse.urlsplit(url)
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
@@ -1653,7 +2656,7 @@ def clean_text(value: Any) -> str:
         return ""
     text = html.unescape(str(value))
     text = re.sub(r"<[^>]+>", " ", text)
-    text = text.replace("\u00ad", "").replace("\xa0", " ")
+    text = text.replace("­", "").replace("\xa0", " ")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
     return text.strip()
@@ -1698,7 +2701,7 @@ def detect_work_mode(hit: Mapping[str, Any], description: str) -> tuple[bool, bo
 
 
 def detect_remote(hit: Mapping[str, Any], description: str) -> bool:
-    """Compatibility helper used by tests and callers interested in any remote signal."""
+    """Any remote signal, hybrid included."""
     return detect_work_mode(hit, description)[0]
 
 
@@ -1721,6 +2724,7 @@ def merge_description(hit: Mapping[str, Any]) -> str:
 
 
 def normalize_job(hit: Mapping[str, Any]) -> JobRecord:
+    """Flatten a JobStream or JobSearch ad into a JobRecord."""
     source_job_id = clean_text(hit.get("id") or hit.get("external_id"))
     if not source_job_id:
         raise ValueError("Job ad has no id")
@@ -1822,9 +2826,12 @@ def should_prefilter(job: JobRecord, settings: Settings) -> tuple[bool, str]:
 
 
 def discovery_score(job: JobRecord, settings: Settings) -> int:
-    score = min(20, 4 * len(job.matched_queries))
-    title = job.title.casefold()
-    score += 8 * sum(1 for term in settings.high_signal_title_terms if term in title)
+    """A tie-breaker only: location preference and remote.
+
+    Title words never add to it - that would be exactly the title matching the
+    ranking exists to avoid. Profile-based ranking decides the order.
+    """
+    score = 0
     location = f"{job.municipality} {job.region}".casefold()
     for index, preferred in enumerate(settings.preferred_locations):
         if preferred.casefold() in location:
@@ -1833,20 +2840,6 @@ def discovery_score(job: JobRecord, settings: Settings) -> int:
     if job.remote:
         score += 2
     return score
-
-
-def build_queries(settings: Settings) -> list[str]:
-    queries: list[str] = []
-    seen: set[str] = set()
-    for term in settings.search_terms:
-        variants = [term] if settings.include_unlocated_searches else []
-        variants.extend(f"{term} {location}" for location in settings.location_terms)
-        for query in variants:
-            normalized = " ".join(query.split()).casefold()
-            if normalized not in seen:
-                seen.add(normalized)
-                queries.append(" ".join(query.split()))
-    return queries
 
 
 def load_json_file(path: Path) -> dict[str, Any]:
@@ -1861,7 +2854,19 @@ def load_json_file(path: Path) -> dict[str, Any]:
     return value
 
 
+SECRET_KEYS: tuple[str, ...] = (
+    "VERTEX_GEMINI_API_KEY",
+    "VERTEX_GEMINI_MODEL",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_BASE_URL",
+    "AZURE_OPENAI_DEPLOYMENT",
+    # Kept only for explicit, manual benchmark scripts.
+    "AI_GATEWAY_API_KEY",
+)
+
+
 def load_secrets(path: Path) -> dict[str, str]:
+    """KEY=VALUE pairs from the secrets file; real environment variables win."""
     result: dict[str, str] = {}
     if path.exists():
         if os.name == "posix":
@@ -1877,21 +2882,14 @@ def load_secrets(path: Path) -> dict[str, str]:
             if line.startswith("export "):
                 line = line[7:].lstrip()
             if "=" not in line:
+                # Never echo the line: it may hold a credential.
                 raise ConfigurationError(f"Invalid secrets line in {path}: expected KEY=VALUE")
             key, value = line.split("=", 1)
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
                 value = value[1:-1]
             result[key.strip()] = value
-    for key in (
-        "VERTEX_GEMINI_API_KEY",
-        "VERTEX_GEMINI_MODEL",
-        "AZURE_OPENAI_API_KEY",
-        "AZURE_OPENAI_BASE_URL",
-        "AZURE_OPENAI_DEPLOYMENT",
-        # Kept only for explicit, manual GLM benchmark scripts.
-        "AI_GATEWAY_API_KEY",
-    ):
+    for key in SECRET_KEYS:
         if os.getenv(key):
             result[key] = os.environ[key]
     return result
@@ -1963,6 +2961,50 @@ def duplicate_fingerprint(company: Any, title: Any, location: Any, description: 
 def row_fingerprint(row: Mapping[str, Any]) -> str:
     location = clean_text(row["municipality"]) or clean_text(row["region"])
     return duplicate_fingerprint(row["company"], row["title"], location, row["description"])
+
+
+def pair_key(company: Any, title: Any) -> str:
+    """Employer and title, normalised: the same posting found through another source."""
+    return f"{fingerprint_text(company)}|{fingerprint_text(title)}"
+
+
+def screen_before_judging(
+    db: "Database",
+    rows: Sequence[sqlite3.Row],
+    settings: Settings,
+    matcher_profile: Mapping[str, Any],
+    profile_version: str,
+    stats: RunStats,
+) -> list[sqlite3.Row]:
+    """Settle, without a model, what needs none, and return the rest.
+
+    An ad the deterministic rules block anyway - seniority against the knowledge
+    catalogue, a student role, a citizenship the candidate lacks, mandatory
+    Swedish above the candidate's level - is stored with those blockers. It
+    leaves the queue exactly as a judged one does, and costs nothing.
+    """
+    swedish = candidate_language_level(matcher_profile, "swedish")
+    eligibility = candidate_eligibility(matcher_profile)
+    years = catalogue_experience_years(matcher_profile.get("knowledge_catalogue"))
+    remaining: list[sqlite3.Row] = []
+    for row in rows:
+        item: dict[str, Any] = {
+            "source_job_id": str(row["source_job_id"]), "career_fit": 0, "opportunity_score": 0,
+            "confidence": 1.0, "actual_role": "", "why_fit": [], "candidate_evidence": [],
+            "must_have_assessment": [], "gaps": [], "blockers": [], "language_risk": "",
+            "seniority_risk": "", "location_note": "",
+        }
+        normalized = normalize_evaluation_policy(
+            item, row, swedish=swedish, eligibility=eligibility,
+            experience_years=years, exclude_student_roles=settings.exclude_student_roles,
+        )
+        if any(is_hard_blocker(blocker) for blocker in normalized["blockers"]):
+            normalized["actual_role"] = "Settled by the deterministic rules"
+            db.save_evaluation(row, validate_evaluation(normalized), profile_version=profile_version, model="rules")
+            stats.rules_screened += 1
+            continue
+        remaining.append(row)
+    return remaining
 
 
 def suppress_duplicate_candidates(
@@ -2091,41 +3133,6 @@ def evaluation_schema() -> dict[str, Any]:
     }
 
 
-def extract_completion_content(response: Mapping[str, Any]) -> str:
-    choices = response.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        raise RemoteAPIError("AI Gateway response missing choices")
-    message = choices[0].get("message")
-    if not isinstance(message, dict):
-        raise RemoteAPIError("AI Gateway response missing message")
-    content = message.get("content")
-    if not isinstance(content, str) or not content.strip():
-        raise RemoteAPIError("AI Gateway returned empty content")
-    return content.strip()
-
-
-def parse_json_object(content: str) -> dict[str, Any]:
-    try:
-        value = json.loads(content)
-    except json.JSONDecodeError:
-        # Compatibility path for providers that wrap JSON in a markdown fence.
-        match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", content, flags=re.DOTALL | re.IGNORECASE)
-        if not match:
-            start, end = content.find("{"), content.rfind("}")
-            if start < 0 or end <= start:
-                raise RemoteAPIError("Model returned invalid JSON")
-            candidate = content[start : end + 1]
-        else:
-            candidate = match.group(1)
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError as exc:
-            raise RemoteAPIError(f"Model returned invalid JSON: {exc}") from exc
-    if not isinstance(value, dict):
-        raise RemoteAPIError("Model response must be a JSON object")
-    return value
-
-
 def bounded_int(value: Any, field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 100:
         raise RemoteAPIError(f"Invalid {field}: expected integer 0..100")
@@ -2147,10 +3154,7 @@ def string_list(value: Any, field: str) -> tuple[str, ...]:
 def object_list(value: Any, field: str) -> tuple[dict[str, str], ...]:
     if not isinstance(value, list) or not all(isinstance(x, dict) for x in value):
         raise RemoteAPIError(f"Invalid {field}: expected object array")
-    out: list[dict[str, str]] = []
-    for item in value:
-        out.append({str(k): clean_text(v) for k, v in item.items()})
-    return tuple(out)
+    return tuple({str(k): clean_text(v) for k, v in item.items()} for item in value)
 
 
 SWEDISH_MANDATORY_PATTERNS = (
@@ -2290,7 +3294,7 @@ def mentions_swedish_language(text: Any) -> bool:
 def candidate_eligibility(profile: Mapping[str, Any]) -> dict[str, str] | None:
     """The candidate's nationality/residence position, or None when unstated.
 
-    None keeps the historical behaviour: an explicit citizenship demand is
+    None keeps the conservative behaviour: an explicit citizenship demand is
     preserved as UNKNOWN rather than guessed at.
     """
     if not isinstance(profile, Mapping):
@@ -2298,7 +3302,10 @@ def candidate_eligibility(profile: Mapping[str, Any]) -> dict[str, str] | None:
     constraints = profile.get("constraints")
     if not isinstance(constraints, Mapping):
         return None
-    read = lambda key: clean_text(constraints.get(key)).casefold()
+
+    def read(key: str) -> str:
+        return clean_text(constraints.get(key)).casefold()
+
     if read("swedish_citizenship") not in {"yes", "no"}:
         return None
     return {
@@ -2321,12 +3328,213 @@ def barred_statuses(eligibility: Mapping[str, str] | None) -> list[str]:
     return barred
 
 
+# ---------------------------------------------------------------------------
+# Seniority and scope, settled from the candidate's knowledge catalogue.
+#
+# How long the candidate has worked is a fact the catalogue records as dated
+# roles, so the engine counts it instead of asking the model to guess. The ad
+# side is read verbatim: a stated number only counts in a sentence that states
+# a requirement, never in one that marks a merit, a company's age or a
+# contract's length.
+# ---------------------------------------------------------------------------
+EXPERIENCE_GAP_HARD_YEARS = 2.0
+SENIOR_TITLE_MIN_YEARS = 5.0
+STRETCH_CAP = 64
+# A stretch card must still be a strong career fit: in end-to-end checks the
+# stretch cards at career fit 70 were the ones read as noise.
+STRETCH_MIN_CAREER_FIT = 75
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "ett": 1, "en": 1, "två": 2, "tre": 3, "fyra": 4, "fem": 5, "sex": 6, "sju": 7, "åtta": 8, "nio": 9, "tio": 10,
+}
+_PERIOD_PATTERN = re.compile(
+    r"(\d{4})(?:-(\d{1,2}))?\s*(?:to|till|-|–|—)\s*(present|now|current|pågående|nu|(\d{4})(?:-(\d{1,2}))?)",
+    re.IGNORECASE,
+)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|[\n\r]+|[•●▪·;]")
+REQUIRED_YEARS_PATTERN = re.compile(
+    r"(?<![\w.])(\d{1,2}|" + "|".join(_NUMBER_WORDS) + r")\s*(\+|or more|eller mer)?\s*"
+    r"(?:(?:-|–|to|till)\s*\d{1,2}\s*)?(?:years?|yrs?|års?|år)(?!\w)",
+    re.IGNORECASE,
+)
+STRONG_REQUIREMENT_CUE = re.compile(r"(minimum|at least|min\.|minst|required|requires|must have|kräver|krav)", re.IGNORECASE)
+EXPERIENCE_CUE = re.compile(
+    r"(experience|erfarenhet|background|track record|arbetat|worked|in (?:developing|building|designing|working))",
+    re.IGNORECASE,
+)
+MERIT_CUE = re.compile(
+    r"(meriterande|merit|nice[- ]to[- ]have|a plus|an advantage|a bonus|fördel|önskvärt|preferably|preferred|"
+    r"gärna|desirable|not a requirement|inget krav|inte ett krav)",
+    re.IGNORECASE,
+)
+COMPANY_AGE_CUE = re.compile(
+    r"(founded|grundad|grundades|history|historia|anniversary|jubileum|been in business|in business for|på marknaden|years old|"
+    r"år gammal|years ago|år sedan|since (?:19|20)\d\d|sedan (?:19|20)\d\d)",
+    re.IGNORECASE,
+)
+SEVERAL_YEARS_PATTERN = re.compile(r"(flera års|flerårig|several years|multiple years|a number of years)", re.IGNORECASE)
+LONG_EXPERIENCE_PATTERN = re.compile(r"(mångårig|many years|lång erfarenhet|gedigen erfarenhet)", re.IGNORECASE)
+# An individual senior grade is a stretch, as an architect title is; a
+# people-management title stays out of reach. When a shadow judge re-read ads
+# rejected for a senior title alone, a fifth of them became strong stretch cards,
+# and none of those carried a management title.
+SENIOR_TITLE_PATTERN = re.compile(
+    # "Staff" counts only as a level ("Staff Engineer"), never in "Member of Technical Staff".
+    r"(?<!\w)(senior|sr|lead|principal|"
+    r"staff (?:engineer|software|developer|data|machine|ml|scientist|designer|product|architect))(?!\w)",
+    re.IGNORECASE,
+)
+MANAGEMENT_TITLE_PATTERN = re.compile(
+    r"(?<!\w)(head of|chief|director|chef|team leader|teamleader)(?!\w)", re.IGNORECASE)
+ARCHITECT_TITLE_PATTERN = re.compile(r"(architect|arkitekt)", re.IGNORECASE)
+# Years demanded in one named field: the judge reports them in a must-have row
+# with this prefix, and the application decides what they cost.
+FIELD_YEARS_PREFIX = "years in field"
+FIELD_YEARS_KEEP_CARD = "_field_years_keep_card"
+EARLY_CAREER_TITLE_PATTERN = re.compile(r"(?<!\w)(junior|trainee|graduate|entry)(?!\w)", re.IGNORECASE)
+EARLY_CAREER_TEXT_PATTERN = re.compile(
+    r"(nyexaminerad|newly graduated|recent graduate|graduate programme|graduate program|entry[- ]level|"
+    r"early[- ]career|few years into your career|(?<!\d)[01]\s*(?:-|–)\s*[23]\s*(?:years|års|år))",
+    re.IGNORECASE,
+)
+STUDENT_TITLE_PATTERN = re.compile(
+    r"(?<!\w)(intern|internship|praktikant|praktik|thesis|exjobb|examensarbete|sommarjobb|summer job|"
+    r"student job|studentjobb)(?!\w)",
+    re.IGNORECASE,
+)
+STUDENT_LEDE_PATTERN = re.compile(
+    r"(praktikant|praktikplats|internship|examensarbete|exjobb|thesis project|master's thesis|sommarjobb)",
+    re.IGNORECASE,
+)
+
+
+def catalogue_experience_years(catalogue: Any, today: dt.date | None = None) -> float | None:
+    """Years of professional experience in the catalogue's dated roles.
+
+    Overlapping roles are counted once. A role without a month counts from its
+    first month and to its last, erring towards more experience rather than
+    less. None when the catalogue dates no role at all.
+    """
+    if not isinstance(catalogue, Mapping):
+        return None
+    today = today or market_today()
+    spans: list[tuple[int, int]] = []
+    for entry in catalogue.get("professional_experience") or []:
+        if not isinstance(entry, Mapping):
+            continue
+        match = _PERIOD_PATTERN.search(str(entry.get("period") or ""))
+        if not match:
+            continue
+        start_month = int(match.group(2)) if match.group(2) and 1 <= int(match.group(2)) <= 12 else 1
+        start = int(match.group(1)) * 12 + start_month - 1
+        if match.group(4) is None:
+            end = today.year * 12 + today.month - 1
+        else:
+            end_month = int(match.group(5)) if match.group(5) and 1 <= int(match.group(5)) <= 12 else 12
+            end = int(match.group(4)) * 12 + end_month - 1
+        if end >= start:
+            spans.append((start, end + 1))
+    if not spans:
+        return None
+    spans.sort()
+    months = 0
+    current_start, current_end = spans[0]
+    for start, end in spans[1:]:
+        if start > current_end:
+            months += current_end - current_start
+            current_start, current_end = start, end
+        else:
+            current_end = max(current_end, end)
+    months += current_end - current_start
+    return round(months / 12, 2)
+
+
+def required_experience_years(description: str) -> tuple[int | None, str]:
+    """The largest years-of-experience requirement an ad states, and the
+    sentence stating it. A number only counts beside a requirement cue, a '+',
+    or the word experience; merits, company ages and contract lengths never do."""
+    best: tuple[int | None, str] = (None, "")
+    for sentence in _SENTENCE_SPLIT.split(description or ""):
+        text = sentence.strip()
+        if not text or MERIT_CUE.search(text) or COMPANY_AGE_CUE.search(text):
+            continue
+        experience = bool(EXPERIENCE_CUE.search(text))
+        found: list[int] = []
+        for match in REQUIRED_YEARS_PATTERN.finditer(text):
+            raw = match.group(1).casefold()
+            count = int(raw) if raw.isdigit() else _NUMBER_WORDS.get(raw)
+            if count is None or not 1 <= count <= 15:
+                continue
+            if match.group(2) or experience or STRONG_REQUIREMENT_CUE.search(text):
+                found.append(count)
+        if experience and SEVERAL_YEARS_PATTERN.search(text):
+            found.append(3)
+        if experience and LONG_EXPERIENCE_PATTERN.search(text):
+            found.append(4)
+        if found and (best[0] is None or max(found) > best[0]):
+            best = (max(found), text[:160])
+    return best
+
+
+def seniority_and_scope_findings(
+    title: str,
+    description: str,
+    experience_years: float | None,
+    exclude_student_roles: bool,
+) -> tuple[list[dict[str, str]], int | None, list[str]]:
+    """Blockers, an opportunity cap and change labels from the ad's own words.
+
+    Seniority is only judged when the knowledge catalogue dates the candidate's
+    experience; without it nothing here decides anything about seniority.
+    """
+    blockers: list[dict[str, str]] = []
+    changes: list[str] = []
+    cap: int | None = None
+    if exclude_student_roles and (
+        STUDENT_TITLE_PATTERN.search(title) or STUDENT_LEDE_PATTERN.search(description[:600])
+    ):
+        blockers.append({"type": "hard", "reason": "Internship, thesis or student role, outside this full-time search."})
+        changes.append("student_role_out_of_scope")
+    if experience_years is None:
+        return blockers, cap, changes
+    early_career = bool(EARLY_CAREER_TITLE_PATTERN.search(title) or EARLY_CAREER_TEXT_PATTERN.search(description))
+    required, quote = required_experience_years(description)
+    if required is not None and required > experience_years:
+        if required - experience_years >= EXPERIENCE_GAP_HARD_YEARS and not early_career:
+            blockers.append({
+                "type": "hard",
+                "reason": f'Requires {required}+ years of experience against {experience_years:g} '
+                          f'in the knowledge catalogue: "{quote}"',
+            })
+            changes.append("experience_years_unmet")
+        else:
+            cap = STRETCH_CAP
+            changes.append("experience_years_stretch")
+    if experience_years < SENIOR_TITLE_MIN_YEARS and not early_career:
+        if MANAGEMENT_TITLE_PATTERN.search(title):
+            blockers.append({
+                "type": "hard",
+                "reason": f'Management title "{clean_text(title)}" against {experience_years:g} years '
+                          f"in the knowledge catalogue.",
+            })
+            changes.append("management_title_unmet")
+        elif SENIOR_TITLE_PATTERN.search(title):
+            cap = STRETCH_CAP
+            changes.append("senior_title_stretch")
+        elif ARCHITECT_TITLE_PATTERN.search(title):
+            cap = STRETCH_CAP
+            changes.append("architect_title_stretch")
+    return blockers, cap, changes
+
+
 def normalize_evaluation_policy(
     item: Mapping[str, Any],
     job: Mapping[str, Any],
     *,
     swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL,
     eligibility: Mapping[str, str] | None = None,
+    experience_years: float | None = None,
+    exclude_student_roles: bool = False,
 ) -> dict[str, Any]:
     """Apply narrow, auditable policy facts before deriving the decision."""
     normalized = dict(item)
@@ -2403,7 +3611,7 @@ def normalize_evaluation_policy(
         blockers = [x for x in blockers if not mentions(x.get("reason"), sensitive_terms)]
         changes.append("screening_not_converted_to_eligibility")
     elif citizenship_unresolved or explicit_clearance:
-        label = "Citizenship eligibility" if citizenship_unresolved else "Security-clearance eligibility"
+        requirement = "Citizenship eligibility" if citizenship_unresolved else "Security-clearance eligibility"
         # With citizenship answered, only clearance is rewritten, so the evaluator's
         # own citizenship finding survives instead of being flattened to unknown.
         terms = sensitive_terms if citizenship_unresolved else clearance_terms
@@ -2411,19 +3619,25 @@ def normalize_evaluation_policy(
         if related:
             for row in related:
                 row["status"] = "unknown"
-                row["reason"] = f"{label} is explicit in the ad but unresolved by candidate evidence."
+                row["reason"] = f"{requirement} is explicit in the ad but unresolved by candidate evidence."
         else:
             must_haves.append({
-                "requirement": label,
+                "requirement": requirement,
                 "status": "unknown",
-                "reason": f"{label} is explicit in the ad but unresolved by candidate evidence.",
+                "reason": f"{requirement} is explicit in the ad but unresolved by candidate evidence.",
             })
         blockers = [x for x in blockers if not mentions(x.get("reason"), terms)]
-        blockers.append({"type": "unknown", "reason": f"{label} requires candidate verification."})
+        blockers.append({"type": "unknown", "reason": f"{requirement} requires candidate verification."})
         changes.append("explicit_eligibility_preserved_unknown")
+
+    def years_in_field(row: Mapping[str, Any]) -> bool:
+        """A row the judge wrote for years demanded in one named field."""
+        return clean_text(row.get("requirement")).casefold().startswith(FIELD_YEARS_PREFIX)
 
     # Lack of evidence for a numeric tenure claim is unknown, not proof of failure.
     for row in must_haves:
+        if years_in_field(row):
+            continue
         combined = f"{clean_text(row.get('requirement'))} {clean_text(row.get('reason'))}"
         if re.search(r"\b\d+\+?\s*(?:years?|yrs?|år)\b", combined, flags=re.IGNORECASE) and mentions(
             row.get("reason"), ("no evidence", "not stated", "not specified", "not provided", "cannot confirm", "cannot verify", "unknown", "unclear")
@@ -2432,12 +3646,40 @@ def normalize_evaluation_policy(
                 row["status"] = "unknown"
                 changes.append("unknown_tenure_preserved")
 
-    # Any genuinely unmet item in the model's mandatory-requirement list is hard.
+    # Any genuinely unmet item in the model's mandatory-requirement list is hard,
+    # except years in a named field, which the application prices below.
     for row in must_haves:
-        if clean_text(row.get("status")).casefold() == "unmet":
+        if clean_text(row.get("status")).casefold() == "unmet" and not years_in_field(row):
             reason = f"Mandatory requirement unmet: {clean_text(row.get('requirement'))}"
             if not any(x.get("type") == "hard" and clean_text(x.get("reason")) == reason for x in blockers):
                 blockers.append({"type": "hard", "reason": reason})
+
+    # Seniority and scope: the catalogue's dates against the ad's own words.
+    title = ""
+    with contextlib.suppress(KeyError, IndexError, TypeError):
+        title = clean_text(job["title"])
+    found, cap, found_changes = seniority_and_scope_findings(
+        title, description, experience_years, exclude_student_roles)
+    blockers.extend(found)
+    if cap is not None:
+        normalized["opportunity_score"] = min(
+            bounded_int(normalized.get("opportunity_score"), "opportunity_score"), cap)
+    changes.extend(found_changes)
+
+    # Years in one named field: a gap caps the ad at a stretch and never removes a
+    # card it would otherwise be. In a shadow judge this demoted wrong-field cards
+    # and deleted none of the real matches.
+    if any(years_in_field(row) and clean_text(row.get("status")).casefold() in {"partial", "unmet"}
+           for row in must_haves):
+        blockers = [
+            x for x in blockers
+            if not (is_hard_blocker(x) and FIELD_YEARS_PREFIX in clean_text(x.get("reason")).casefold())
+        ]
+        opportunity = bounded_int(normalized.get("opportunity_score"), "opportunity_score")
+        career_fit = bounded_int(normalized.get("career_fit"), "career_fit")
+        normalized[FIELD_YEARS_KEEP_CARD] = classify_decision(career_fit, opportunity, blockers).startswith("notify")
+        normalized["opportunity_score"] = min(opportunity, STRETCH_CAP)
+        changes.append("field_years_stretch")
 
     normalized["must_have_assessment"] = must_haves
     normalized["blockers"] = blockers
@@ -2462,7 +3704,7 @@ def classify_decision(career_fit: int, opportunity: int, blockers: Sequence[Mapp
         return "notify_strong"
     if opportunity >= 70:
         return "notify_good"
-    if opportunity >= 60:
+    if opportunity >= 60 and career_fit >= STRETCH_MIN_CAREER_FIT:
         return "notify_stretch"
     return "store_no_notify"
 
@@ -2473,12 +3715,16 @@ def validate_evaluation(
     job: Mapping[str, Any] | None = None,
     swedish: LanguageLevel = UNKNOWN_LANGUAGE_LEVEL,
     eligibility: Mapping[str, str] | None = None,
+    experience_years: float | None = None,
+    exclude_student_roles: bool = False,
 ) -> Evaluation:
-    normalized = (
-        normalize_evaluation_policy(item, job, swedish=swedish, eligibility=eligibility)
+    item = (
+        normalize_evaluation_policy(
+            item, job, swedish=swedish, eligibility=eligibility,
+            experience_years=experience_years, exclude_student_roles=exclude_student_roles,
+        )
         if job is not None else dict(item)
     )
-    item = normalized
     source_job_id = clean_text(item.get("source_job_id"))
     if not source_job_id:
         raise RemoteAPIError("Evaluation missing source_job_id")
@@ -2496,6 +3742,9 @@ def validate_evaluation(
         if blocker.get("type") not in valid_blockers:
             raise RemoteAPIError(f"Invalid blocker type for {source_job_id}")
     decision = classify_decision(career_fit, opportunity, blockers)
+    if item.get(FIELD_YEARS_KEEP_CARD) and not decision.startswith("notify"):
+        # A years-in-field gap may demote a card to a stretch, never remove it.
+        decision = "notify_stretch"
     return Evaluation(
         source_job_id=source_job_id,
         career_fit=career_fit,
@@ -2515,20 +3764,106 @@ def validate_evaluation(
     )
 
 
+KNOWLEDGE_CATALOGUE_FILE = "knowledge_catalogue.json"
+# Who the candidate is, as opposed to what they can do, never reaches a model.
+CATALOGUE_IDENTITY_KEYS = ("candidate",)
+
+
 def load_profile_bundle(settings: Settings) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """The matcher profile, with the knowledge catalogue attached when present,
+    the matching rules, and the version both together define."""
     matcher_profile = load_json_file(settings.profile_dir / "matcher_profile.json")
     matcher_rules = load_json_file(settings.profile_dir / "matcher_rules_v1_1.json")
+    catalogue_path = settings.profile_dir / KNOWLEDGE_CATALOGUE_FILE
+    if catalogue_path.exists():
+        catalogue = load_json_file(catalogue_path)
+        matcher_profile["knowledge_catalogue"] = {
+            key: value for key, value in catalogue.items() if key not in CATALOGUE_IDENTITY_KEYS
+        }
     return matcher_profile, matcher_rules, profile_version(matcher_profile, matcher_rules)
 
 
-def fetch_jobs(
-    client: JobSearchClient,
+# ---------------------------------------------------------------------------
+# Discovery: Platsbanken through JobStream and JobSearch.
+# ---------------------------------------------------------------------------
+def fetch_jobstream(
+    client: Any,
+    db: "Database",
     settings: Settings,
     stats: RunStats,
-) -> dict[str, JobRecord]:
-    merged: dict[str, JobRecord] = {}
+    *,
+    now: dt.datetime | None = None,
+) -> tuple[dict[str, JobRecord], str]:
+    """Read the stream since the stored cursor.
+
+    Returns the live jobs and the cursor to store once they are persisted. The
+    caller advances the cursor, not this function: advancing before the jobs are
+    stored would turn a crash into a silent gap. Unpublished ads are counted and
+    skipped, because nothing downstream has a closed state to move them into.
+    """
+    current = (now or dt.datetime.now(UTC)).replace(tzinfo=None, microsecond=0)
+    since: dt.datetime | None = None
+    stored = db.get_meta(JOBSTREAM_CURSOR_KEY)
+    if stored:
+        try:
+            since = dt.datetime.fromisoformat(stored)
+        except ValueError:
+            LOG.warning("Ignoring unreadable JobStream cursor %r", stored)
+    if since is None:
+        since = current - dt.timedelta(hours=settings.jobstream_lookback_hours)
+    oldest = current - dt.timedelta(hours=settings.jobstream_max_window_hours)
+    if since < oldest:
+        LOG.warning(
+            "JobStream cursor %s is more than %dh old; clamping. Ads changed in the gap "
+            "are not replayed.",
+            since.isoformat(), settings.jobstream_max_window_hours,
+        )
+        stats.stream_window_clamped = True
+        since = oldest
+
+    # One second of overlap: a duplicate costs nothing, a gap loses a job.
+    ads = client.stream(since - dt.timedelta(seconds=1))
+    stats.stream_entries = len(ads)
+    jobs: dict[str, JobRecord] = {}
+    for ad in ads:
+        if not isinstance(ad, dict):
+            continue
+        if ad.get("removed"):
+            stats.stream_removed += 1
+            continue
+        try:
+            job = normalize_job(ad)
+        except (ValueError, TypeError) as exc:
+            stats.stream_malformed += 1
+            LOG.warning("Skipping malformed job ad: %s", exc)
+            continue
+        jobs[job.source_job_id] = job
+    stats.unique_jobs = len(jobs)
+    for job in jobs.values():
+        job.discovery_score = discovery_score(job, settings)
+    return jobs, current.isoformat()
+
+
+def build_queries(settings: Settings) -> list[str]:
+    """search_terms crossed with location_terms, deduplicated case-insensitively."""
+    queries: list[str] = []
+    seen: set[str] = set()
+    for term in settings.search_terms:
+        variants = [term] if settings.include_unlocated_searches or not settings.location_terms else []
+        variants.extend(f"{term} {location}" for location in settings.location_terms)
+        for query in variants:
+            normalized = " ".join(query.split())
+            if normalized.casefold() not in seen:
+                seen.add(normalized.casefold())
+                queries.append(normalized)
+    return queries
+
+
+def fetch_jobsearch(client: Any, settings: Settings, stats: RunStats) -> dict[str, JobRecord]:
+    """Run every keyword query; a failed query is logged, all failing raises."""
     queries = build_queries(settings)
-    LOG.info("Running %d discovery queries", len(queries))
+    LOG.info("Running %d JobSearch queries", len(queries))
+    merged: dict[str, JobRecord] = {}
     failures = 0
     for index, query in enumerate(queries, start=1):
         stats.queries_attempted += 1
@@ -2537,33 +3872,26 @@ def fetch_jobs(
             stats.queries_succeeded += 1
         except RemoteAPIError as exc:
             failures += 1
-            LOG.error("Query failed [%s]: %s", query, exc)
+            LOG.error("JobSearch query failed [%s]: %s", query, compact_sentence(exc, 200))
             continue
         stats.search_hits += len(hits)
         for hit in hits:
             try:
                 job = normalize_job(hit)
             except (ValueError, TypeError) as exc:
-                LOG.warning("Skipping malformed job: %s", exc)
+                LOG.warning("Skipping malformed job ad: %s", exc)
                 continue
             if not job.description:
                 try:
-                    full = client.ad(job.source_job_id)
-                    job = normalize_job(full)
+                    job = normalize_job(client.ad(job.source_job_id))
                 except (RemoteAPIError, ValueError, TypeError) as exc:
-                    LOG.warning("Could not hydrate ad %s: %s", job.source_job_id, exc)
-            existing = merged.get(job.source_job_id)
-            if existing is None:
-                job.matched_queries.add(query)
-                merged[job.source_job_id] = job
-            else:
-                existing.matched_queries.add(query)
+                    LOG.warning("Could not load the full ad %s: %s", job.source_job_id, exc)
+            existing = merged.setdefault(job.source_job_id, job)
+            existing.matched_queries.add(query)
         if settings.query_delay_seconds and index < len(queries):
             time.sleep(settings.query_delay_seconds)
-
-    if stats.queries_succeeded == 0:
+    if queries and stats.queries_succeeded == 0:
         raise RemoteAPIError(f"All {failures} JobSearch queries failed")
-    stats.unique_jobs = len(merged)
     for job in merged.values():
         job.discovery_score = discovery_score(job, settings)
     return merged
@@ -2583,6 +3911,1245 @@ def persist_discovered_jobs(
             continue
         db.upsert_job(job)
         stats.jobs_upserted += 1
+
+
+# ---------------------------------------------------------------------------
+# Discovery: company career sites.
+#
+# Many employers publish vacancies on their own career site that never reach
+# Platsbanken, and most of those sites run on a handful of applicant-tracking
+# systems with a public feed. One collector per platform turns a feed into
+# JobRecords; from then on a posting is ranked, screened and judged like any
+# other ad. Collectors read public endpoints only, one site at a time, with a
+# pause between detail pages.
+# ---------------------------------------------------------------------------
+CAREER_SITE_SOURCE = "career_site"
+
+_HTML_SCRIPT_STYLE = re.compile(r"<(script|style)\b.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+_HTML_BREAK = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_HTML_LIST_ITEM = re.compile(r"<li\b[^>]*>", re.IGNORECASE)
+_HTML_BLOCK_END = re.compile(r"</(?:p|div|li|h[1-6]|tr|section|article|ul|ol)\s*>", re.IGNORECASE)
+_HTML_TAG = re.compile(r"<[^>]+>")
+
+
+def html_to_text(value: Any) -> str:
+    """Readable plain text from posting HTML, keeping paragraph and list breaks."""
+    if not value:
+        return ""
+    text = _HTML_SCRIPT_STYLE.sub(" ", str(value))
+    text = _HTML_BREAK.sub("\n", text)
+    text = _HTML_LIST_ITEM.sub("\n- ", text)
+    text = _HTML_BLOCK_END.sub("\n", text)
+    text = html.unescape(_HTML_TAG.sub(" ", text))
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ").replace("­", "")
+    lines = (" ".join(line.split()) for line in text.split("\n"))
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def parse_date(value: Any) -> str | None:
+    """YYYY-MM-DD from an ISO date or timestamp, or an RFC 822 date; None otherwise."""
+    text = clean_text(value)
+    if not text:
+        return None
+    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", text)
+    if match:
+        with contextlib.suppress(ValueError):
+            return dt.date(*(int(part) for part in match.groups())).isoformat()
+        return None
+    with contextlib.suppress(TypeError, ValueError, IndexError):
+        return email.utils.parsedate_to_datetime(text).date().isoformat()
+    return None
+
+
+def text_list(value: Any) -> str:
+    if isinstance(value, list):
+        return ", ".join(clean_text(item) for item in value if clean_text(item))
+    return clean_text(value)
+
+
+# Folded place names. A location naming Sweden or a Swedish city is Swedish; one
+# naming another country or a large foreign city is not; anything else falls
+# back to the site's default country, because losing a Swedish role to an
+# unrecognised office name costs more than reading a foreign one.
+_SWEDISH_PLACES = (
+    "sweden", "sverige", "stockholm", "goteborg", "gothenburg", "malmo", "lund", "uppsala", "linkoping",
+    "vasteras", "orebro", "helsingborg", "norrkoping", "jonkoping", "umea", "lulea", "gavle", "boras",
+    "sodertalje", "eskilstuna", "halmstad", "vaxjo", "karlstad", "sundsvall", "ostersund", "kista", "solna",
+    "sundbyberg", "nacka", "skovde", "trollhattan", "karlskrona", "kalmar", "visby", "ludvika",
+)
+_FOREIGN_PLACES = (
+    "united states", "usa", "us", "canada", "mexico", "brazil", "argentina", "colombia", "chile",
+    "united kingdom", "uk", "england", "ireland", "scotland", "germany", "deutschland", "france", "spain",
+    "portugal", "italy", "netherlands", "belgium", "poland", "czech", "hungary", "romania", "bulgaria",
+    "austria", "switzerland", "greece", "turkey", "ukraine", "serbia", "croatia", "denmark", "danmark",
+    "norway", "norge", "finland", "suomi", "iceland", "estonia", "latvia", "lithuania", "india", "china",
+    "japan", "korea", "singapore", "malaysia", "indonesia", "vietnam", "taiwan", "australia", "new zealand",
+    "israel", "egypt", "south africa", "nigeria", "kenya", "philippines", "uae", "dubai",
+    "washington", "california", "texas", "new york", "san francisco", "seattle", "boston", "chicago",
+    "austin", "toronto", "vancouver", "montreal", "sao paulo", "mexico city", "bogota",
+    "london", "manchester", "dublin", "berlin", "munich", "munchen", "hamburg", "frankfurt", "cologne",
+    "koln", "stuttgart", "dusseldorf", "paris", "lyon", "madrid", "barcelona", "lisbon", "porto", "milan",
+    "milano", "rome", "amsterdam", "rotterdam", "brussels", "antwerp", "zurich", "geneva", "vienna", "wien",
+    "prague", "praha", "warsaw", "warszawa", "krakow", "wroclaw", "budapest", "bucharest", "sofia",
+    "athens", "istanbul", "kyiv", "belgrade", "copenhagen", "kobenhavn", "aarhus", "oslo", "bergen",
+    "trondheim", "helsinki", "espoo", "tampere", "tallinn", "riga", "vilnius", "bangalore", "bengaluru",
+    "mumbai", "delhi", "hyderabad", "chennai", "pune", "beijing", "shanghai", "shenzhen", "tokyo", "seoul",
+    "taipei", "sydney", "melbourne", "auckland", "tel aviv", "cairo", "nairobi", "lagos",
+)
+_SWEDISH_PLACE_PATTERN = re.compile(r"(?<![a-z])(?:" + "|".join(map(re.escape, _SWEDISH_PLACES)) + r")(?![a-z])")
+_FOREIGN_PLACE_PATTERN = re.compile(r"(?<![a-z])(?:" + "|".join(map(re.escape, _FOREIGN_PLACES)) + r")(?![a-z])")
+
+
+def country_name(value: Any) -> str:
+    """A structured country value as stored: 'Sverige' for Sweden, otherwise as given."""
+    if isinstance(value, Mapping):
+        value = value.get("descriptor") or value.get("name") or value.get("addressCountry")
+    text = clean_text(value)
+    return "Sverige" if text.casefold() in {"se", "swe", "sweden", "sverige"} else text
+
+
+def place_country(text: str) -> str:
+    """'Sverige' or 'Outside Sweden' when a free-text location says which, else ''."""
+    folded = fold_text(text)
+    if _SWEDISH_PLACE_PATTERN.search(folded):
+        return "Sverige"
+    if _FOREIGN_PLACE_PATTERN.search(folded):
+        return "Outside Sweden"
+    return ""
+
+
+def career_site_job(
+    site: CareerSite,
+    *,
+    key: Any,
+    title: Any,
+    url: Any,
+    description: str,
+    company: Any = "",
+    city: Any = "",
+    region: Any = "",
+    location: Any = "",
+    country: Any = "",
+    remote: bool = False,
+    published: str | None = None,
+    deadline: str | None = None,
+    employment_type: Any = "",
+) -> JobRecord | None:
+    """One posting as a JobRecord, or None while it carries no usable text."""
+    key, title, description = clean_text(key), clean_text(title), description.strip()
+    if not key or not title or len(description) < len(title) + 20:
+        return None
+    location = clean_text(location)
+    municipality = clean_text(city) or location.split(",")[0].strip() or clean_text(site.option("city"))
+    region = clean_text(region) or clean_text(site.option("region"))
+    resolved_country = (
+        country_name(country)
+        or place_country(" ".join((location, municipality, region)))
+        or clean_text(site.option("country", "Sverige"))
+    )
+    remote = remote or bool(re.search(r"\b(remote|distans)\b", location, re.IGNORECASE))
+    any_remote, fully_remote = detect_work_mode({"remote": remote}, description)
+    return JobRecord(
+        source_job_id=f"{site.name}:{key}",
+        title=title,
+        company=site.company or clean_text(company) or site.name,
+        url=clean_text(url) or site.url,
+        municipality=municipality,
+        region=region,
+        country=resolved_country,
+        remote=any_remote,
+        fully_remote=fully_remote,
+        application_deadline=deadline,
+        published_at=published,
+        employment_type=clean_text(employment_type),
+        scope="",
+        description=description,
+        raw_json={"career_site": site.name, "platform": site.platform, "posting_key": key},
+    )
+
+
+def jobposting_place(posting: Mapping[str, Any]) -> tuple[str, str, str]:
+    """(city, region, country) from a schema.org JobPosting's first location."""
+    places = posting.get("jobLocation")
+    place = places[0] if isinstance(places, list) and places else places
+    address = place.get("address") if isinstance(place, Mapping) else None
+    if not isinstance(address, Mapping):
+        return "", "", ""
+    city = clean_text(address.get("addressLocality"))
+    region = clean_text(address.get("addressRegion"))
+    country = country_name(address.get("addressCountry"))
+    if region and country_name(region) == country:
+        region = ""  # some feeds repeat the country as the region
+    return city, region, country
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _polite_pause(settings: Settings) -> None:
+    if settings.query_delay_seconds:
+        time.sleep(settings.query_delay_seconds)
+
+
+def _site_int(site: CareerSite, key: str, default: int) -> int:
+    value = site.option(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigurationError(f"career site {site.name}: {key} must be a positive integer")
+    return value
+
+
+def collect_teamtailor(http: HttpClient, site: CareerSite, settings: Settings, known: set[str]) -> list[JobRecord]:
+    """Teamtailor publishes `{site}/jobs.json`: a JSON Feed with every open job,
+    its full description and an embedded schema.org JobPosting."""
+    feed = http.json_request("GET", f"{site.url}/jobs.json", timeout=settings.career_site_timeout_seconds)
+    items = feed.get("items")
+    if not isinstance(items, list):
+        raise RemoteAPIError(f"The Teamtailor feed at {site.url} has no items array")
+    feed_company = clean_text(feed.get("title"))
+    jobs: list[JobRecord] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        posting = _mapping(item.get("_jobposting"))
+        city, region, country = jobposting_place(posting)
+        job = career_site_job(
+            site,
+            key=item.get("id") or item.get("url"),
+            title=posting.get("title") or item.get("title"),
+            url=item.get("url"),
+            description=html_to_text(posting.get("description") or item.get("content_html")),
+            company=_mapping(posting.get("hiringOrganization")).get("name") or feed_company,
+            city=city, region=region, country=country,
+            remote=clean_text(posting.get("jobLocationType")).upper() == "TELECOMMUTE",
+            published=parse_date(posting.get("datePosted") or item.get("date_published")),
+            deadline=parse_date(posting.get("validThrough")),
+            employment_type=text_list(posting.get("employmentType")),
+        )
+        if job is not None:
+            jobs.append(job)
+    return jobs
+
+
+_VARBI_JOB_ID = re.compile(r"jobID:(\d+)", re.IGNORECASE)
+_VARBI_FEED_TITLE = re.compile(r"^(?:new jobs at|nya lediga jobb hos)\s+", re.IGNORECASE)
+
+
+def collect_varbi(http: HttpClient, site: CareerSite, settings: Settings, known: set[str]) -> list[JobRecord]:
+    """Varbi, used by Swedish universities and agencies, publishes an RSS feed at
+    `{site}/what:rssfeed/`. The feed names no city, so `city` and `region` come
+    from the site's configuration."""
+    body = http.fetch(
+        f"{site.url}/what:rssfeed/",
+        timeout=settings.career_site_timeout_seconds,
+        accept="application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+    )
+    try:
+        # ElementTree resolves no external entities, and expat bounds entity expansion.
+        root = ET.fromstring(body)
+    except ET.ParseError as exc:
+        raise RemoteAPIError(f"The Varbi feed at {site.url} is not valid XML: {exc}") from exc
+    company = _VARBI_FEED_TITLE.sub("", clean_text(root.findtext("channel/title")))
+    jobs: list[JobRecord] = []
+    for item in root.iter("item"):
+        link = clean_text(item.findtext("link"))
+        job_id = _VARBI_JOB_ID.search(link)
+        if job_id is None:
+            continue
+        job = career_site_job(
+            site,
+            key=job_id.group(1),
+            title=item.findtext("title"),
+            url=link,
+            description=html_to_text(item.findtext("description")),
+            company=company,
+            published=parse_date(item.findtext("pubDate")),
+        )
+        if job is not None:
+            jobs.append(job)
+    return jobs
+
+
+def collect_greenhouse(http: HttpClient, site: CareerSite, settings: Settings, known: set[str]) -> list[JobRecord]:
+    """Greenhouse's public job-board API returns the whole board, descriptions included."""
+    board = urllib.parse.quote(clean_text(site.option("board")), safe="")
+    payload = http.json_request(
+        "GET", f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs?content=true",
+        timeout=settings.career_site_timeout_seconds,
+    )
+    postings = payload.get("jobs")
+    if not isinstance(postings, list):
+        raise RemoteAPIError(f"The Greenhouse board {board} returned no jobs array")
+    jobs: list[JobRecord] = []
+    for posting in postings:
+        if not isinstance(posting, Mapping):
+            continue
+        job = career_site_job(
+            site,
+            key=posting.get("id"),
+            title=posting.get("title"),
+            url=posting.get("absolute_url"),
+            # Greenhouse sends the description as escaped HTML.
+            description=html_to_text(html.unescape(str(posting.get("content") or ""))),
+            company=posting.get("company_name"),
+            location=_mapping(posting.get("location")).get("name"),
+            published=parse_date(posting.get("first_published") or posting.get("updated_at")),
+        )
+        if job is not None:
+            jobs.append(job)
+    return jobs
+
+
+def collect_lever(http: HttpClient, site: CareerSite, settings: Settings, known: set[str]) -> list[JobRecord]:
+    """Lever's postings API returns every posting with its description. Boards on
+    Lever's EU instance need `"instance": "eu"`."""
+    board = urllib.parse.quote(clean_text(site.option("board")), safe="")
+    host = "api.eu.lever.co" if clean_text(site.option("instance")).casefold() == "eu" else "api.lever.co"
+    postings = http.json_request(
+        "GET", f"https://{host}/v0/postings/{board}?mode=json",
+        timeout=settings.career_site_timeout_seconds, expect=list,
+    )
+    jobs: list[JobRecord] = []
+    for posting in postings:
+        if not isinstance(posting, Mapping):
+            continue
+        categories = _mapping(posting.get("categories"))
+        parts = [clean_text(posting.get("descriptionPlain")) or html_to_text(posting.get("description"))]
+        for block in posting.get("lists") or []:
+            if isinstance(block, Mapping):
+                parts.append(f"{clean_text(block.get('text'))}\n{html_to_text(block.get('content'))}")
+        parts.append(clean_text(posting.get("additionalPlain")))
+        created = posting.get("createdAt")
+        published = (
+            dt.datetime.fromtimestamp(created / 1000, UTC).date().isoformat()
+            if isinstance(created, (int, float)) and not isinstance(created, bool) else None
+        )
+        job = career_site_job(
+            site,
+            key=posting.get("id"),
+            title=posting.get("text"),
+            url=posting.get("hostedUrl") or posting.get("applyUrl"),
+            description="\n\n".join(part for part in parts if part.strip()),
+            location=categories.get("location"),
+            country=posting.get("country"),
+            remote=clean_text(posting.get("workplaceType")).casefold() == "remote",
+            published=published,
+            employment_type=categories.get("commitment"),
+        )
+        if job is not None:
+            jobs.append(job)
+    return jobs
+
+
+def collect_ashby(http: HttpClient, site: CareerSite, settings: Settings, known: set[str]) -> list[JobRecord]:
+    """Ashby's public job-board API returns the whole board, descriptions included."""
+    board = urllib.parse.quote(clean_text(site.option("board")), safe="")
+    payload = http.json_request(
+        "GET", f"https://api.ashbyhq.com/posting-api/job-board/{board}?includeCompensation=false",
+        timeout=settings.career_site_timeout_seconds,
+    )
+    postings = payload.get("jobs")
+    if not isinstance(postings, list):
+        raise RemoteAPIError(f"The Ashby board {board} returned no jobs array")
+    jobs: list[JobRecord] = []
+    for posting in postings:
+        if not isinstance(posting, Mapping) or posting.get("isListed") is False:
+            continue
+        postal = _mapping(_mapping(posting.get("address")).get("postalAddress"))
+        job = career_site_job(
+            site,
+            key=posting.get("id"),
+            title=posting.get("title"),
+            url=posting.get("jobUrl"),
+            description=html_to_text(posting.get("descriptionHtml")) or clean_text(posting.get("descriptionPlain")),
+            company=payload.get("name"),
+            city=postal.get("addressLocality"),
+            region=postal.get("addressRegion"),
+            country=postal.get("addressCountry"),
+            location=posting.get("location"),
+            remote=bool(posting.get("isRemote")),
+            published=parse_date(posting.get("publishedAt")),
+            employment_type=posting.get("employmentType"),
+        )
+        if job is not None:
+            jobs.append(job)
+    return jobs
+
+
+SMARTRECRUITERS_API = "https://api.smartrecruiters.com/v1/companies"
+SMARTRECRUITERS_SECTIONS = ("companyDescription", "jobDescription", "qualifications", "additionalInformation")
+
+
+def collect_smartrecruiters(
+    http: HttpClient, site: CareerSite, settings: Settings, known: set[str]
+) -> list[JobRecord]:
+    """SmartRecruiters lists postings without descriptions, filtered server-side
+    by `country` (default "se"). Each description is one detail request, so only
+    postings not yet stored are fetched, at most career_site_max_details a run."""
+    company = urllib.parse.quote(clean_text(site.option("board")), safe="")
+    country = clean_text(site.option("country", "se"))
+    listings: list[Mapping[str, Any]] = []
+    for offset in range(0, 100 * _site_int(site, "max_pages", 10), 100):
+        query = {"limit": 100, "offset": offset, **({"country": country} if country else {})}
+        page = http.json_request(
+            "GET", f"{SMARTRECRUITERS_API}/{company}/postings?{urllib.parse.urlencode(query)}",
+            timeout=settings.career_site_timeout_seconds,
+        )
+        content = page.get("content")
+        if not isinstance(content, list):
+            raise RemoteAPIError(f"The SmartRecruiters board {company} returned no content array")
+        listings.extend(item for item in content if isinstance(item, Mapping))
+        if len(content) < 100:
+            break
+    jobs: list[JobRecord] = []
+    details = 0
+    for listing in listings:
+        posting_id = clean_text(listing.get("id"))
+        if not posting_id or posting_id in known:
+            continue
+        if details >= settings.career_site_max_details:
+            break
+        details += 1
+        _polite_pause(settings)
+        try:
+            detail = http.json_request(
+                "GET", f"{SMARTRECRUITERS_API}/{company}/postings/{urllib.parse.quote(posting_id, safe='')}",
+                timeout=settings.career_site_timeout_seconds,
+            )
+        except RemoteAPIError as exc:
+            LOG.warning("SmartRecruiters posting %s could not be read: %s", posting_id, compact_sentence(exc, 200))
+            continue
+        sections = _mapping(_mapping(detail.get("jobAd")).get("sections"))
+        place = _mapping(listing.get("location"))
+        job = career_site_job(
+            site,
+            key=posting_id,
+            title=listing.get("name"),
+            url=detail.get("postingUrl") or f"https://jobs.smartrecruiters.com/{company}/{posting_id}",
+            description="\n\n".join(
+                text for text in (html_to_text(_mapping(sections.get(name)).get("text"))
+                                  for name in SMARTRECRUITERS_SECTIONS) if text
+            ),
+            company=_mapping(listing.get("company")).get("name"),
+            city=place.get("city"),
+            region=place.get("region"),
+            country=place.get("country"),
+            remote=bool(place.get("remote")),
+            published=parse_date(listing.get("releasedDate")),
+            employment_type=_mapping(listing.get("typeOfEmployment")).get("label"),
+        )
+        if job is not None:
+            jobs.append(job)
+    return jobs
+
+
+WORKDAY_PAGE_SIZE = 20
+
+
+def collect_workday(http: HttpClient, site: CareerSite, settings: Settings, known: set[str]) -> list[JobRecord]:
+    """Workday career sites answer a JSON search at `{site}/wday/cxs/{tenant}/{site}/jobs`.
+
+    `applied_facets` narrows the list server-side (a country, for instance) and
+    `search_text` filters it. The list carries no descriptions, so only postings
+    not yet stored get a detail request, at most career_site_max_details a run.
+    """
+    tenant = urllib.parse.quote(clean_text(site.option("tenant")), safe="")
+    board = urllib.parse.quote(clean_text(site.option("site")), safe="")
+    facets = site.option("applied_facets", {})
+    if not isinstance(facets, Mapping):
+        raise ConfigurationError(f"career site {site.name}: applied_facets must be an object")
+    api = f"{site.url}/wday/cxs/{tenant}/{board}"
+    postings: dict[str, Mapping[str, Any]] = {}
+    total: int | None = None
+    for page in range(_site_int(site, "max_pages", 25)):
+        payload = http.json_request(
+            "POST", f"{api}/jobs",
+            payload={"appliedFacets": dict(facets), "limit": WORKDAY_PAGE_SIZE,
+                     "offset": page * WORKDAY_PAGE_SIZE, "searchText": clean_text(site.option("search_text", ""))},
+            timeout=settings.career_site_timeout_seconds,
+        )
+        if total is None:
+            # Workday reports the total on the first page only.
+            with contextlib.suppress(TypeError, ValueError):
+                total = int(payload.get("total") or 0)
+        batch = payload.get("jobPostings")
+        if not isinstance(batch, list):
+            raise RemoteAPIError(f"The Workday site {site.url} returned no jobPostings array")
+        for posting in batch:
+            path = clean_text(_mapping(posting).get("externalPath"))
+            if path:
+                postings.setdefault(path, posting)
+        if len(batch) < WORKDAY_PAGE_SIZE or (page + 1) * WORKDAY_PAGE_SIZE >= (total or 0):
+            break
+
+    locale = clean_text(site.option("locale", "en-US"))
+    jobs: list[JobRecord] = []
+    details = 0
+    for path, posting in postings.items():
+        if path in known:
+            continue
+        if details >= settings.career_site_max_details:
+            break
+        details += 1
+        _polite_pause(settings)
+        try:
+            info = _mapping(http.json_request(
+                "GET", f"{api}{path}", timeout=settings.career_site_timeout_seconds).get("jobPostingInfo"))
+        except RemoteAPIError as exc:
+            LOG.warning("Workday posting %s could not be read: %s", path, compact_sentence(exc, 200))
+            continue
+        job = career_site_job(
+            site,
+            key=path,
+            title=info.get("title") or posting.get("title"),
+            url=info.get("externalUrl") or f"{site.url}/{locale}/{board}{path}",
+            description=html_to_text(info.get("jobDescription")),
+            location=info.get("location") or posting.get("locationsText"),
+            country=info.get("country"),
+            employment_type=info.get("timeType"),
+        )
+        if job is not None:
+            jobs.append(job)
+    return jobs
+
+
+_SF_ROW = re.compile(
+    r'<a[^>]+class="[^"]*jobTitle-link[^"]*"[^>]*href="(?P<href>/job/[^"]+)"[^>]*>(?P<title>.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+_SF_JOB_ID = re.compile(r"/job/[^/]*/(\d+)/?")
+_SF_DESCRIPTION = re.compile(r'<span class="jobdescription">(.*?)</span>\s*</div>', re.IGNORECASE | re.DOTALL)
+_SF_LOCATION = re.compile(r'<span[^>]+class="[^"]*jobLocation[^"]*"[^>]*>(.*?)</span>', re.IGNORECASE | re.DOTALL)
+
+
+def collect_successfactors(
+    http: HttpClient, site: CareerSite, settings: Settings, known: set[str]
+) -> list[JobRecord]:
+    """SAP SuccessFactors career sites have no public JSON API, but render the
+    same markup for every customer: a search page listing `jobTitle-link` rows,
+    filtered by `location_search` (default "Sweden"), and one page per job.
+    Detail pages are fetched only for postings not yet stored."""
+    query_base = {"q": "", "sortColumn": "referencedate", "sortDirection": "desc"}
+    location_search = clean_text(site.option("location_search", "Sweden"))
+    if location_search:
+        query_base["locationsearch"] = location_search
+    rows: dict[str, tuple[str, str]] = {}
+    start = page_size = 0
+    for _ in range(_site_int(site, "max_pages", 10)):
+        query = {**query_base, **({"startrow": start} if start else {})}
+        page = http.fetch(
+            f"{site.url}/search/?{urllib.parse.urlencode(query)}",
+            timeout=settings.career_site_timeout_seconds, accept="text/html,*/*;q=0.8",
+        ).decode("utf-8", errors="replace")
+        found: dict[str, tuple[str, str]] = {}
+        for match in _SF_ROW.finditer(page):
+            job_id = _SF_JOB_ID.search(match.group("href"))
+            if job_id:  # the markup links each row twice
+                found.setdefault(job_id.group(1), (match.group("href"), html_to_text(match.group("title"))))
+        new = {job_id: row for job_id, row in found.items() if job_id not in rows}
+        rows.update(new)
+        page_size = page_size or len(found)
+        if not new or len(found) < page_size:
+            break
+        start += len(found)
+
+    jobs: list[JobRecord] = []
+    details = 0
+    for job_id, (href, title) in rows.items():
+        if job_id in known:
+            continue
+        if details >= settings.career_site_max_details:
+            break
+        details += 1
+        _polite_pause(settings)
+        url = urllib.parse.urljoin(f"{site.url}/", href.lstrip("/"))
+        try:
+            page = http.fetch(url, timeout=settings.career_site_timeout_seconds, accept="text/html,*/*;q=0.8")
+        except RemoteAPIError as exc:
+            LOG.warning("SuccessFactors posting %s could not be read: %s", job_id, compact_sentence(exc, 200))
+            continue
+        text = page.decode("utf-8", errors="replace")
+        body = _SF_DESCRIPTION.search(text)
+        # A customised page loses the description wrapper; the whole page still reads.
+        description = html_to_text(body.group(1)) if body else html_to_text(text)[:14_000]
+        location = _SF_LOCATION.search(text)
+        slug_city = urllib.parse.unquote(href.split("/")[2].split("-")[0]) if href.count("/") >= 3 else ""
+        job = career_site_job(
+            site,
+            key=job_id,
+            title=title,
+            url=url,
+            description=description,
+            location=html_to_text(location.group(1)) if location else slug_city,
+        )
+        if job is not None:
+            jobs.append(job)
+    return jobs
+
+
+CareerSiteCollector = Callable[[HttpClient, CareerSite, Settings, "set[str]"], "list[JobRecord]"]
+CAREER_SITE_COLLECTORS: dict[str, CareerSiteCollector] = {
+    "teamtailor": collect_teamtailor,
+    "varbi": collect_varbi,
+    "greenhouse": collect_greenhouse,
+    "lever": collect_lever,
+    "ashby": collect_ashby,
+    "smartrecruiters": collect_smartrecruiters,
+    "workday": collect_workday,
+    "successfactors": collect_successfactors,
+}
+
+
+def collect_career_sites(http: HttpClient, db: Database, settings: Settings, stats: RunStats) -> list[str]:
+    """Read every configured career site and store its postings; return the sites that failed.
+
+    A failing site is logged and skipped, never fatal. A posting already stored
+    from another source under the same employer and title is the same vacancy
+    and stays out, and an unchanged posting is not written again.
+    """
+    elsewhere = {
+        pair_key(row[0], row[1])
+        for row in db.conn.execute("SELECT company, title FROM jobs WHERE source <> ?", (CAREER_SITE_SOURCE,))
+    }
+    failed: list[str] = []
+    for site in settings.career_sites:
+        stored = db.content_hashes(CAREER_SITE_SOURCE, prefix=f"{site.name}:")
+        known = {source_id.split(":", 1)[1] for source_id in stored}
+        try:
+            jobs = CAREER_SITE_COLLECTORS[site.platform](http, site, settings, known)
+        except Exception as exc:  # a broken or redesigned site must never stop discovery
+            stats.career_sites_failed += 1
+            failed.append(site.name)
+            LOG.error("Career site %s (%s) failed: %s", site.name, site.platform, compact_sentence(exc, 300),
+                      exc_info=not isinstance(exc, RoleLensError))
+            continue
+        stats.career_sites_read += 1
+        written = 0
+        for job in jobs:
+            stats.career_site_jobs_seen += 1
+            if pair_key(job.company, job.title) in elsewhere:
+                stats.career_site_jobs_known += 1
+                continue
+            if stored.get(job.source_job_id) == job.content_hash:
+                continue
+            if should_prefilter(job, settings)[0]:
+                stats.jobs_prefiltered += 1
+                continue
+            job.discovery_score = discovery_score(job, settings)
+            db.upsert_job(job, source=CAREER_SITE_SOURCE)
+            written += 1
+        stats.career_site_jobs_stored += written
+        LOG.info("Career site %s (%s): %d posting(s) read, %d new or changed",
+                 site.name, site.platform, len(jobs), written)
+    return failed
+
+
+def discover(http: HttpClient, db: Database, settings: Settings, stats: RunStats) -> None:
+    """Read every enabled source and store what it finds. Costs no model tokens.
+
+    A failing source is reported and the others still run. Only a run in which
+    every enabled source failed raises, so the scheduler surfaces it.
+    """
+    attempted = succeeded = 0
+    if settings.use_jobstream:
+        attempted += 1
+        try:
+            jobs, next_cursor = fetch_jobstream(JobStreamClient(http, settings), db, settings, stats)
+            persist_discovered_jobs(db, jobs.values(), settings, stats)
+            # Advance only once the batch is stored, so a failure anywhere above
+            # replays the same window next run instead of silently skipping it.
+            db.set_meta(JOBSTREAM_CURSOR_KEY, next_cursor)
+            succeeded += 1
+        except RemoteAPIError as exc:
+            stats.discovery_failures.append("JobStream")
+            LOG.error("JobStream failed: %s", compact_sentence(exc, 300))
+    if settings.search_terms:
+        attempted += 1
+        try:
+            found = fetch_jobsearch(JobSearchClient(http, settings), settings, stats)
+            persist_discovered_jobs(db, found.values(), settings, stats)
+            succeeded += 1
+        except RemoteAPIError as exc:
+            stats.discovery_failures.append("JobSearch")
+            LOG.error("JobSearch failed: %s", compact_sentence(exc, 300))
+    if settings.career_sites:
+        attempted += 1
+        failed = collect_career_sites(http, db, settings, stats)
+        stats.discovery_failures.extend(f"career site {name}" for name in failed)
+        if len(failed) < len(settings.career_sites):
+            succeeded += 1
+    LOG.info(
+        "Discovery: %d stream entries (%d unpublished), %d JobSearch hits from %d/%d queries, "
+        "%d career-site posting(s) from %d site(s); %d stored, %d prefiltered",
+        stats.stream_entries, stats.stream_removed, stats.search_hits, stats.queries_succeeded,
+        stats.queries_attempted, stats.career_site_jobs_seen, stats.career_sites_read,
+        stats.jobs_upserted + stats.career_site_jobs_stored, stats.jobs_prefiltered,
+    )
+    if attempted and not succeeded:
+        raise RemoteAPIError("Every discovery source failed: " + ", ".join(stats.discovery_failures))
+
+
+# ---------------------------------------------------------------------------
+# Ranking: which stored ads the evaluator reads.
+#
+# Independent orders over the same ads: a weighted role vocabulary built from
+# the candidate's own files, the embedding similarity between an ad and the
+# closest section of the matcher profile, and - optionally - the competencies
+# JobTech's enrichment finds the ad requesting. Reciprocal rank fusion combines
+# them, and an ad is selected when it sits within the top share of every ad
+# ranked in the reference window. Every score reads the title and the
+# description together, so no title decides anything on its own.
+# ---------------------------------------------------------------------------
+_FOLD_WHITESPACE = re.compile("[ \t ]+")
+
+
+def fold_text(value: str) -> str:
+    """Lowercase, strip diacritics, collapse spaces and tabs.
+
+    Line breaks survive, so a phrase never matches across one.
+    """
+    decomposed = unicodedata.normalize("NFKD", value.lower())
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return _FOLD_WHITESPACE.sub(" ", stripped).strip()
+
+
+def ranking_text(title: Any, description: Any) -> str:
+    """The text every score reads, cut where the calibration cut it."""
+    return f"{title}\n{description}"[:RANK_TEXT_CHARS]
+
+
+@dataclasses.dataclass(frozen=True)
+class RoleVocabulary:
+    """Weighted role terms, matched word-aware against folded ad text.
+
+    A space at either end of a term marks a word boundary on that side, and a
+    term of four characters or fewer gets both, so " rag " never fires inside
+    "uppdrag" nor " erp" inside "enterprise". A boundary applies only where the
+    term itself starts or ends with a letter or digit, which keeps "rag-"
+    matching "rag-baserad". Each term counts once per ad, and negative weights
+    mark professions the candidate cannot do.
+    """
+
+    terms: tuple[tuple[re.Pattern[str], float, str], ...]
+    fingerprint: str
+
+    @classmethod
+    def from_terms(cls, raw_terms: Mapping[str, Any]) -> "RoleVocabulary":
+        compiled: list[tuple[re.Pattern[str], float, str]] = []
+        for raw_term, weight in raw_terms.items():
+            if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+                raise ConfigurationError(f"Vocabulary term {raw_term!r} needs a numeric weight")
+            term = fold_text(raw_term)
+            if not term:
+                continue
+            short = len(term) <= 4
+            start = (raw_term[:1] == " " or short) and term[:1].isalnum()
+            end = (raw_term[-1:] == " " or short) and term[-1:].isalnum()
+            pattern = (
+                (r"(?<![0-9a-z])" if start else "")
+                + re.escape(term)
+                + (r"(?![0-9a-z])" if end else "")
+            )
+            compiled.append((re.compile(pattern), float(weight), term))
+        if not compiled:
+            raise ConfigurationError("The role vocabulary has no terms")
+        canonical = json.dumps(raw_terms, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return cls(tuple(compiled), hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16])
+
+    @classmethod
+    def load(cls, path: Path) -> "RoleVocabulary":
+        terms = load_json_file(path).get("terms")
+        if not isinstance(terms, dict):
+            raise ConfigurationError(f"{path} must map each term to a weight under 'terms'")
+        return cls.from_terms(terms)
+
+    def score(self, text: str) -> float:
+        folded = fold_text(text)
+        return float(sum(weight for pattern, weight, _ in self.terms if pattern.search(folded)))
+
+
+def profile_facets(settings: Settings) -> tuple[tuple[str, str], ...]:
+    """The candidate as separately embedded sections of matcher_profile.json.
+
+    Sections stay apart so one strong area can match an ad without being
+    averaged away by the rest, and a section too long for one embedding is
+    split by its own keys rather than cut off.
+    """
+    profile = load_json_file(settings.profile_dir / "matcher_profile.json")
+    facets: list[tuple[str, str]] = []
+    for section in PROFILE_FACET_SECTIONS:
+        value = profile.get(section)
+        if not value:
+            continue
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        if len(text) <= PROFILE_FACET_CHARS or not isinstance(value, dict):
+            facets.append((section, text[:PROFILE_FACET_CHARS]))
+            continue
+        for key, part in value.items():
+            if part:
+                part_text = part if isinstance(part, str) else json.dumps(part, ensure_ascii=False)
+                facets.append((f"{section}.{key}", part_text[:PROFILE_FACET_CHARS]))
+    if not facets:
+        raise ConfigurationError(
+            "matcher_profile.json has none of the sections that rank jobs: " + ", ".join(PROFILE_FACET_SECTIONS)
+        )
+    return tuple(facets)
+
+
+@dataclasses.dataclass(frozen=True)
+class RankingContext:
+    """Everything a rank depends on, and the keys that change when it does."""
+
+    vocabulary: RoleVocabulary
+    facets: tuple[tuple[str, str], ...]
+    embedding_model: str
+    enrichment: bool = False
+
+    @classmethod
+    def load(cls, settings: Settings) -> "RankingContext":
+        return cls(
+            vocabulary=RoleVocabulary.load(settings.profile_dir / "role_vocabulary.json"),
+            facets=profile_facets(settings),
+            embedding_model=settings.embedding_model,
+            enrichment=settings.use_enrichment,
+        )
+
+    @property
+    def embedding_key(self) -> str:
+        """Names one embedding of the profile; a new profile or model gets a new one."""
+        canonical = json.dumps(
+            {"model": self.embedding_model, "dimensions": EMBEDDING_DIMENSIONS, "facets": self.facets},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+    @property
+    def ranking_key(self) -> str:
+        """Names one way of ranking. When it changes, the whole window is ranked again."""
+        enrichment = ENRICHMENT_VERSION if self.enrichment else "no-enrichment"
+        canonical = f"{self.embedding_key}:{self.vocabulary.fingerprint}:{RANK_TEXT_CHARS}:{RRF_K}:{enrichment}"
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+class EmbeddingClient:
+    """Vertex AI text embeddings through the publisher-model predict endpoint.
+
+    Vectors are requested at EMBEDDING_DIMENSIONS and normalised here: shortened
+    gemini-embedding-001 vectors come back unscaled, and a dot product is only a
+    cosine similarity between unit vectors.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        secrets: Mapping[str, str],
+        http: HttpClient | None = None,
+    ) -> None:
+        self.model = settings.embedding_model
+        self.api_key = secrets.get("VERTEX_GEMINI_API_KEY", "")
+        if not self.api_key:
+            raise ConfigurationError("VERTEX_GEMINI_API_KEY is required for ranking embeddings")
+        self.url = f"{GEMINI_BASE_URL}/{urllib.parse.quote(self.model, safe='')}:predict"
+        self.http = http or HttpClient(
+            retries=settings.http_retries, user_agent=f"{APP_NAME}/{APP_VERSION}"
+        )
+        self.timeout = settings.embedding_timeout_seconds
+        self.batch_size = settings.embedding_batch_size
+        self.calls = 0
+        self.tokens = 0
+        self.quota_pauses = 0
+        self.sleep = time.sleep
+
+    def embed(self, texts: Sequence[str], task_type: str) -> list[array.array | None]:
+        """One unit vector per text, in order.
+
+        A text the model rejects on its own comes back as None. Anything else -
+        a bad key, exhausted retries, a malformed answer - raises RemoteAPIError.
+        """
+        vectors: list[array.array | None] = []
+        position = 0
+        rejected_in_a_row = 0
+        while position < len(texts):
+            chunk = list(texts[position:position + self.batch_size])
+            try:
+                response = self.http.json_request(
+                    "POST",
+                    self.url,
+                    headers={"x-goog-api-key": self.api_key},
+                    payload={
+                        "instances": [{"content": text, "task_type": task_type} for text in chunk],
+                        "parameters": {"outputDimensionality": EMBEDDING_DIMENSIONS},
+                    },
+                    timeout=self.timeout,
+                )
+            except RateLimitError:
+                if self.quota_pauses >= EMBEDDING_QUOTA_MAX_PAUSES:
+                    raise
+                self.quota_pauses += 1
+                LOG.warning(
+                    "Embedding quota reached; pausing %ds (%d of at most %d this run)",
+                    EMBEDDING_QUOTA_PAUSE_SECONDS, self.quota_pauses, EMBEDDING_QUOTA_MAX_PAUSES,
+                )
+                self.sleep(EMBEDDING_QUOTA_PAUSE_SECONDS)
+                continue
+            except HttpStatusError as exc:
+                # A bad key also answers 400; only a request-shaped 400 is recoverable.
+                if exc.status != 400 or "API key" in str(exc) or "API_KEY" in str(exc):
+                    raise
+                if len(chunk) > 1:
+                    self.batch_size = max(1, len(chunk) // 2)
+                    LOG.warning("Embedding request rejected; %d ad(s) per request from now on", self.batch_size)
+                    continue
+                rejected_in_a_row += 1
+                if rejected_in_a_row >= 3:
+                    raise
+                LOG.warning("The embedding model rejected one ad; it ranks on the vocabulary alone")
+                vectors.append(None)
+                position += 1
+                continue
+            self.calls += 1
+            rejected_in_a_row = 0
+            vectors.extend(self._vectors(response, len(chunk)))
+            position += len(chunk)
+        return vectors
+
+    def _vectors(self, response: Mapping[str, Any], expected: int) -> list[array.array]:
+        predictions = response.get("predictions")
+        if not isinstance(predictions, list) or len(predictions) != expected:
+            raise RemoteAPIError(f"Embedding response did not carry {expected} prediction(s)")
+        vectors: list[array.array] = []
+        for prediction in predictions:
+            embeddings = prediction.get("embeddings") if isinstance(prediction, dict) else None
+            raw_values = embeddings.get("values") if isinstance(embeddings, dict) else None
+            try:
+                values = [float(value) for value in raw_values]
+            except (TypeError, ValueError) as exc:
+                raise RemoteAPIError("Embedding response carried no numeric vector") from exc
+            norm = math.sqrt(sum(value * value for value in values))
+            if len(values) != EMBEDDING_DIMENSIONS or not norm:
+                raise RemoteAPIError(
+                    f"Embedding response vector is not a non-zero {EMBEDDING_DIMENSIONS}-dimensional vector"
+                )
+            statistics = embeddings.get("statistics")
+            if isinstance(statistics, dict):
+                with contextlib.suppress(TypeError, ValueError):
+                    self.tokens += int(round(float(statistics.get("token_count") or 0)))
+            vectors.append(array.array("f", (value / norm for value in values)))
+        return vectors
+
+
+def requested_concepts(candidates: Mapping[str, Any]) -> dict[str, float]:
+    """The competencies and occupations an enriched text requests.
+
+    Keys are 'comp:<label>' and 'occ:<label>', values the highest probability
+    seen that the employer requires them; terms merely mentioned stay out.
+    """
+    concepts: dict[str, float] = {}
+    for kind, prefix in (("competencies", "comp"), ("occupations", "occ")):
+        for candidate in candidates.get(kind) or []:
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                prediction = float(candidate.get("prediction") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            concept = str(candidate.get("concept_label") or "").strip().lower()
+            if concept and prediction >= ENRICHMENT_PREDICTION_FLOOR:
+                key = f"{prefix}:{concept}"
+                concepts[key] = max(concepts.get(key, 0.0), prediction)
+    return concepts
+
+
+def enrichment_score(ad_concepts: Mapping[str, float], profile: Mapping[str, float]) -> float:
+    """Requested concepts the candidate's profile also names, weighted by how
+    surely the employer requires them. An occupation counts double."""
+    return float(sum(
+        prediction * (2.0 if key.startswith("occ:") else 1.0)
+        for key, prediction in ad_concepts.items()
+        if key in profile
+    ))
+
+
+class EnrichmentClient:
+    """Arbetsförmedlingen's JobAd Enrichments API, ten texts per request."""
+
+    def __init__(self, http: HttpClient, *, timeout: int = 120) -> None:
+        self.http = http
+        self.timeout = timeout
+        self.calls = 0
+
+    def enrich(self, documents: Sequence[tuple[str, str, str]]) -> dict[str, dict[str, float]]:
+        """doc id -> requested concepts, for (doc id, headline, text) documents.
+
+        A document the API rejects on its own is left out. Any other failure
+        raises RemoteAPIError, after the HTTP client's own retries.
+        """
+        found: dict[str, dict[str, float]] = {}
+        for start in range(0, len(documents), ENRICHMENT_BATCH):
+            batch = list(documents[start:start + ENRICHMENT_BATCH])
+            try:
+                self._post(batch, found)
+            except HttpStatusError as exc:
+                if exc.status != 400:
+                    raise
+                for single in batch:
+                    with contextlib.suppress(HttpStatusError):
+                        self._post([single], found)
+        return found
+
+    def _post(self, batch: Sequence[tuple[str, str, str]], found: dict[str, dict[str, float]]) -> None:
+        response = self.http.json_request(
+            "POST",
+            ENRICHMENT_URL,
+            payload={
+                "documents_input": [
+                    {"doc_id": doc_id, "doc_headline": headline, "doc_text": text[:9000]}
+                    for doc_id, headline, text in batch
+                ],
+                "include_terms_info": True,
+                "include_sentences": False,
+                "sort_by_prediction_score": "DESC",
+            },
+            timeout=self.timeout,
+            expect=list,
+        )
+        self.calls += 1
+        for document in response:
+            if isinstance(document, dict) and document.get("doc_id") is not None:
+                candidates = document.get("enriched_candidates")
+                found[str(document["doc_id"])] = requested_concepts(
+                    candidates if isinstance(candidates, dict) else {})
+
+
+def profile_concepts(db: Database, context: RankingContext, enricher: Any) -> dict[str, float]:
+    """The concepts the candidate's own profile names, enriched once per profile."""
+    key = "profile_concepts:" + hashlib.sha256(
+        json.dumps([ENRICHMENT_VERSION, context.facets], ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:16]
+    cached = db.get_meta(key)
+    if cached:
+        with contextlib.suppress(json.JSONDecodeError):
+            concepts = json.loads(cached)
+            if isinstance(concepts, dict) and concepts:
+                return concepts
+    found = enricher.enrich([(f"facet{n}", name, text) for n, (name, text) in enumerate(context.facets)])
+    concepts = {}
+    for document in found.values():
+        for concept, prediction in document.items():
+            concepts[concept] = max(concepts.get(concept, 0.0), prediction)
+    if not concepts:
+        raise RemoteAPIError("Enriching the profile named no concepts")
+    db.set_meta(key, json.dumps(concepts, ensure_ascii=False, sort_keys=True))
+    return concepts
+
+
+def dot(a: Sequence[float], b: Sequence[float]) -> float:
+    return sum(map(operator.mul, a, b))
+
+
+def fractional_ranks(values: Sequence[float]) -> list[float]:
+    """1-based ranks, highest value first, with tied values sharing their average rank.
+
+    Averaging keeps ties neutral. Breaking them by storage order would favour
+    whichever ads happened to be stored first, and giving a tied block its best
+    position would select all of it at once.
+    """
+    order = sorted(range(len(values)), key=values.__getitem__, reverse=True)
+    ranks = [0.0] * len(values)
+    start = 0
+    while start < len(order):
+        end = start
+        while end + 1 < len(order) and values[order[end + 1]] == values[order[start]]:
+            end += 1
+        shared = (start + end) / 2 + 1
+        for index in order[start:end + 1]:
+            ranks[index] = shared
+        start = end + 1
+    return ranks
+
+
+def selection_percentiles(
+    pool: Sequence[tuple[Any, ...]],
+) -> dict[int, tuple[float, bool]]:
+    """job id -> (share of the pool at or above it, ranked with embeddings).
+
+    Each entry is (job id, vocabulary score, embedding score or None, and
+    optionally an enrichment score or None). Ads with all three scores are
+    ordered by reciprocal rank fusion of the three orders, among the ads that
+    have all three. Ads without an enrichment score fuse vocabulary and
+    embeddings among every ad with an embedding, and ads ranked while
+    embeddings were unavailable are ordered by vocabulary alone, among every ad
+    in the pool.
+    """
+    def fuse(rows: Sequence[tuple[Any, ...]], *columns: int) -> list[float]:
+        ranks = [fractional_ranks([float(row[column]) for row in rows]) for column in columns]
+        fused = [sum(1.0 / (RRF_K + order[n]) for order in ranks) for n in range(len(rows))]
+        return [rank / len(rows) for rank in fractional_ranks(fused)]
+
+    result: dict[int, tuple[float, bool]] = {}
+    embedded = [row for row in pool if row[2] is not None]
+    enriched = [row for row in embedded if len(row) > 3 and row[3] is not None]
+    if embedded:
+        for row, percentile in zip(embedded, fuse(embedded, 1, 2)):
+            result[row[0]] = (percentile, True)
+    if enriched:
+        for row, percentile in zip(enriched, fuse(enriched, 1, 2, 3)):
+            result[row[0]] = (percentile, True)
+    if len(embedded) < len(pool):
+        for row, percentile in zip(pool, fuse(pool, 1)):
+            if row[2] is None:
+                result[row[0]] = (percentile, False)
+    return result
+
+
+def embedding_failure_reason(error: BaseException) -> str:
+    """A short, bounded label for why a ranking service failed, for the run record and the alert."""
+    if isinstance(error, RateLimitError):
+        return "http_429"
+    status = getattr(error, "status", None)
+    return f"http_{status}" if isinstance(status, int) else type(error).__name__
+
+
+def explored(source_job_id: Any, content_hash: Any, share: float) -> bool:
+    """Whether an ad the cut left out is judged anyway, as part of the random check.
+
+    Decided by a hash of the ad and its content, so an ad gets the same answer on
+    every re-rank: the sample is random across ads, never re-rolled until every
+    ad has been read.
+    """
+    if share <= 0:
+        return False
+    digest = hashlib.sha256(f"explore:{source_job_id}:{content_hash}".encode("utf-8")).hexdigest()
+    return int(digest[:12], 16) / float(16 ** 12) < share
+
+
+def rank_new_jobs(
+    db: Database,
+    settings: Settings,
+    stats: RunStats,
+    *,
+    context: RankingContext,
+    client: Any,
+    enricher: Any = None,
+    now: dt.datetime | None = None,
+) -> None:
+    """Score every unranked ad in the window, then select the top share.
+
+    An embedding failure never stops a run. The affected ads rank on the
+    vocabulary alone against the wider degraded share, and those it leaves out
+    are ranked again once embeddings answer.
+    """
+    current = now or dt.datetime.now(UTC)
+    since = (current - dt.timedelta(days=settings.ranking_reference_days)).isoformat(timespec="microseconds")
+    rows = db.unranked_jobs(context.ranking_key, since=since, limit=settings.max_rank_per_run)
+    if not rows:
+        return
+
+    texts = [ranking_text(row["title"], row["description"]) for row in rows]
+    embedding_scores: list[float | None] = [None] * len(rows)
+    calls_before, tokens_before, pauses_before = client.calls, client.tokens, client.quota_pauses
+    try:
+        profile_vectors = db.get_profile_embedding(context.embedding_key)
+        if profile_vectors is None:
+            embedded = client.embed([text for _, text in context.facets], "RETRIEVAL_QUERY")
+            if any(vector is None for vector in embedded):
+                raise RemoteAPIError("The embedding model rejected a profile section")
+            profile_vectors = [vector for vector in embedded if vector is not None]
+            db.save_profile_embedding(
+                context.embedding_key, context.embedding_model,
+                [name for name, _ in context.facets], profile_vectors,
+            )
+        for start in range(0, len(texts), EMBEDDING_CHUNK):
+            vectors = client.embed(texts[start:start + EMBEDDING_CHUNK], "RETRIEVAL_DOCUMENT")
+            for offset, vector in enumerate(vectors):
+                if vector is not None:
+                    embedding_scores[start + offset] = max(dot(vector, facet) for facet in profile_vectors)
+    except RemoteAPIError as exc:
+        stats.embedding_failure = embedding_failure_reason(exc)
+        LOG.warning("Embeddings unavailable; ranking on the vocabulary alone: %s", compact_sentence(exc, 300))
+    finally:
+        stats.embedding_calls += client.calls - calls_before
+        stats.embedding_tokens += client.tokens - tokens_before
+        stats.embedding_quota_pauses += client.quota_pauses - pauses_before
+    if any(score is None for score in embedding_scores):
+        stats.ranking_degraded = True
+
+    # Enrichment is a third order, never a gate: without it the run ranks on
+    # vocabulary and embeddings alone.
+    enrichment_scores: list[float | None] = [None] * len(rows)
+    enrichment_concepts: list[dict[str, float] | None] = [None] * len(rows)
+    if context.enrichment and enricher is not None:
+        try:
+            wanted = profile_concepts(db, context, enricher)
+            found = enricher.enrich([
+                (str(row["source_job_id"]), str(row["title"]), str(row["description"])) for row in rows
+            ])
+            for n, row in enumerate(rows):
+                concepts = found.get(str(row["source_job_id"]))
+                if concepts is not None:
+                    enrichment_concepts[n] = concepts
+                    enrichment_scores[n] = enrichment_score(concepts, wanted)
+        except RemoteAPIError as exc:
+            stats.enrichment_failure = embedding_failure_reason(exc)
+            LOG.warning("Enrichment unavailable; ranking without it this run: %s", compact_sentence(exc, 300))
+        stats.jobs_enriched += sum(1 for score in enrichment_scores if score is not None)
+
+    vocabulary_scores = [context.vocabulary.score(text) for text in texts]
+    db.save_rank_scores(context.ranking_key, [
+        (
+            int(row["id"]), str(row["content_hash"]), vocabulary, embedding, enrichment,
+            None if concepts is None else json.dumps(concepts, ensure_ascii=False, sort_keys=True),
+        )
+        for row, vocabulary, embedding, enrichment, concepts
+        in zip(rows, vocabulary_scores, embedding_scores, enrichment_scores, enrichment_concepts)
+    ])
+
+    pool = [
+        (
+            int(row["id"]),
+            float(row["vocabulary_score"]),
+            None if row["embedding_score"] is None else float(row["embedding_score"]),
+            None if row["enrichment_score"] is None else float(row["enrichment_score"]),
+        )
+        for row in db.ranking_reference(context.ranking_key, since=since)
+    ]
+    percentiles = selection_percentiles(pool)
+    fail_open = len(pool) < RANKING_MIN_POOL
+    decisions: list[tuple[int, float, str, str | None]] = []
+    for row in rows:
+        percentile, with_embeddings = percentiles[int(row["id"])]
+        share = settings.evaluate_top_share if with_embeddings else settings.degraded_top_share
+        reason = None
+        if fail_open:
+            reason = "fail_open"
+        elif percentile <= share:
+            reason = "rank"
+        elif explored(row["source_job_id"], row["content_hash"], settings.explore_share):
+            reason = "explore"
+        decisions.append((int(row["id"]), percentile, "selected" if reason else "not_selected", reason))
+    db.save_selection(decisions)
+
+    selected_now = sum(1 for _, _, state, _ in decisions if state == "selected")
+    explored_now = sum(1 for _, _, _, reason in decisions if reason == "explore")
+    stats.jobs_ranked += len(rows)
+    stats.jobs_selected += selected_now
+    stats.jobs_explored += explored_now
+    stats.ranking_pool = len(pool)
+    if fail_open:
+        stats.ranking_fail_open = True
+        LOG.warning(
+            "Only %d ranked ad(s) in the %d-day window; selecting all %d instead of trusting a percentile",
+            len(pool), settings.ranking_reference_days, len(rows),
+        )
+    LOG.info(
+        "Ranking: %d ad(s) ranked against %d in the window, %d selected (%d by the random check)%s; "
+        "%d embedding call(s), %d quota pause(s), %d token(s), about $%.4f",
+        len(rows), len(pool), selected_now, explored_now,
+        " - DEGRADED, vocabulary only" if stats.ranking_degraded else "",
+        stats.embedding_calls, stats.embedding_quota_pauses, stats.embedding_tokens,
+        stats.embedding_tokens / 1_000_000 * EMBEDDING_USD_PER_MILLION_TOKENS.get(settings.embedding_model, 0.0),
+    )
 
 
 def format_notifications(rows: Sequence[sqlite3.Row]) -> str:
@@ -2616,9 +5183,10 @@ def format_notifications(rows: Sequence[sqlite3.Row]) -> str:
         if gaps:
             lines.append("Gap: " + " · ".join(compact_sentence(x, 120) for x in gaps[:2]))
         if blockers:
-            rendered = []
-            for blocker in blockers[:2]:
-                rendered.append(f"{blocker.get('type','?')}: {compact_sentence(blocker.get('reason',''), 120)}")
+            rendered = [
+                f"{blocker.get('type', '?')}: {compact_sentence(blocker.get('reason', ''), 120)}"
+                for blocker in blockers[:2]
+            ]
             lines.append("⚠️ " + " · ".join(rendered))
         if row["application_deadline"]:
             lines.append(f"Deadline: {row['application_deadline']}")
@@ -2641,12 +5209,20 @@ TEMPLATE_MARKERS: tuple[str, ...] = (
     "(fictional)",
     "profile_status\": \"example",
 )
+REQUIRED_PROFILE_FILES: tuple[str, ...] = (
+    "career_profile.json", "matcher_profile.json", "search_lenses.json",
+    "matcher_rules_v1_1.json", "role_vocabulary.json",
+)
+PERSONAL_PROFILE_FILES: tuple[str, ...] = (
+    "career_profile.json", "matcher_profile.json", "search_lenses.json",
+    "role_vocabulary.json", KNOWLEDGE_CATALOGUE_FILE,
+)
 
 
 def unedited_templates(settings: Settings) -> list[str]:
     """Profile files that still look like the shipped examples."""
     still_template: list[str] = []
-    for name in ("career_profile.json", "matcher_profile.json", "search_lenses.json"):
+    for name in PERSONAL_PROFILE_FILES:
         path = settings.profile_dir / name
         try:
             text = path.read_text(encoding="utf-8")
@@ -2658,15 +5234,11 @@ def unedited_templates(settings: Settings) -> list[str]:
 
 
 def doctor(settings: Settings, *, require_key: bool = True) -> dict[str, Any]:
+    """Validate local configuration, profile and credentials. No network, no cost."""
     settings.home.mkdir(parents=True, exist_ok=True)
     settings.db_path.parent.mkdir(parents=True, exist_ok=True)
-    required = [
-        settings.profile_dir / "career_profile.json",
-        settings.profile_dir / "matcher_profile.json",
-        settings.profile_dir / "search_lenses.json",
-        settings.profile_dir / "matcher_rules_v1_1.json",
-    ]
-    missing = [str(path) for path in required if not path.exists()]
+    missing = [str(settings.profile_dir / name) for name in REQUIRED_PROFILE_FILES
+               if not (settings.profile_dir / name).exists()]
     if missing:
         raise ConfigurationError(
             "Missing profile files: " + ", ".join(missing)
@@ -2678,6 +5250,7 @@ def doctor(settings: Settings, *, require_key: bool = True) -> dict[str, Any]:
         )
 
     matcher_profile, matcher_rules, version = load_profile_bundle(settings)
+    ranking = RankingContext.load(settings)
     secrets = load_secrets(settings.secrets_path)
     required_keys = (
         "VERTEX_GEMINI_API_KEY",
@@ -2691,13 +5264,9 @@ def doctor(settings: Settings, *, require_key: bool = True) -> dict[str, Any]:
     if require_key and missing_keys:
         hint = ""
         if templates:
-            hint = (
-                " Also still unedited: " + ", ".join(templates)
-                + " in " + str(settings.profile_dir) + "."
-            )
+            hint = " Also still unedited: " + ", ".join(templates) + " in " + str(settings.profile_dir) + "."
         raise ConfigurationError(
-            "Missing provider configuration in "
-            f"{settings.secrets_path}: {', '.join(missing_keys)}.{hint}"
+            f"Missing provider configuration in {settings.secrets_path}: {', '.join(missing_keys)}.{hint}"
         )
     swedish = candidate_language_level(matcher_profile, "swedish")
     todo: list[str] = []
@@ -2707,10 +5276,7 @@ def doctor(settings: Settings, *, require_key: bool = True) -> dict[str, Any]:
             + " - they still contain the shipped example candidate."
         )
     if missing_keys:
-        todo.append(
-            "Add " + ", ".join(missing_keys) + " to " + str(settings.secrets_path)
-            + " (chmod 600)."
-        )
+        todo.append("Add " + ", ".join(missing_keys) + " to " + str(settings.secrets_path) + " (chmod 600).")
     if not swedish.known:
         todo.append(
             "Set constraints.swedish in matcher_profile.json - the Swedish level is "
@@ -2718,12 +5284,18 @@ def doctor(settings: Settings, *, require_key: bool = True) -> dict[str, Any]:
         )
 
     return {
+        "version": APP_VERSION,
         "home": str(settings.home),
         "database": str(settings.db_path),
         "primary_provider": settings.primary_provider,
         "fallback_provider": settings.fallback_provider,
         "profile_version": version,
-        "queries_per_run": len(build_queries(settings)),
+        "discovery": {
+            "jobstream": settings.use_jobstream,
+            "jobstream_lookback_hours": settings.jobstream_lookback_hours,
+            "jobsearch_queries": len(build_queries(settings)),
+            "career_sites": {site.name: site.platform for site in settings.career_sites},
+        },
         "provider_credentials_present": not missing_keys,
         "missing_credentials": missing_keys,
         "profile_keys": len(matcher_profile),
@@ -2732,6 +5304,28 @@ def doctor(settings: Settings, *, require_key: bool = True) -> dict[str, Any]:
         "candidate_swedish_level": swedish.label,
         "max_candidates_per_run": settings.max_candidates_per_run,
         "max_jobs_per_batch": settings.max_jobs_per_batch,
+        "monthly_budget_usd": settings.monthly_budget_usd,
+        "knowledge_catalogue": "knowledge_catalogue" in matcher_profile,
+        "catalogue_experience_years": catalogue_experience_years(matcher_profile.get("knowledge_catalogue")),
+        "exclude_student_roles": settings.exclude_student_roles,
+        "first_read": {
+            "model": settings.triage_model or "off, the judge reads every ad",
+            "thinking_budget": settings.triage_thinking_budget,
+            "ads_per_call": settings.triage_batch_size,
+            "settles_rejections_below_fit": TRIAGE_SETTLE_BELOW_FIT,
+        },
+        "ranking": {
+            "method": "role vocabulary + profile embeddings" + (" + JobTech enrichment" if settings.use_enrichment else "")
+                      + ", reciprocal rank fusion",
+            "embedding_model": settings.embedding_model,
+            "vocabulary_terms": len(ranking.vocabulary.terms),
+            "profile_sections": len(ranking.facets),
+            "evaluate_top_share": settings.evaluate_top_share,
+            "degraded_top_share": settings.degraded_top_share,
+            "explore_share": settings.explore_share,
+            "enrichment": settings.use_enrichment,
+            "reference_days": settings.ranking_reference_days,
+        },
         "ready": not missing_keys and not templates,
         "next_steps": todo,
     }
@@ -2746,6 +5340,67 @@ def add_provider_usage(stats: RunStats, usage: Mapping[str, int]) -> None:
     stats.total_tokens += int(usage.get("total_tokens") or (prompt + completion))
 
 
+def estimated_run_cost_usd(stats: Mapping[str, Any]) -> float:
+    """Provider spend of one run, from the token counts it recorded.
+
+    Judge tokens are priced at the dearer provider's rates, and reasoning is
+    added to output even where a provider already counts it there, so the
+    estimate errs high rather than low.
+    """
+    def tokens(key: str) -> int:
+        value = stats.get(key)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+    judge = (
+        tokens("prompt_tokens") * JUDGE_USD_PER_MILLION_TOKENS[0]
+        + (tokens("completion_tokens") + tokens("reasoning_tokens")) * JUDGE_USD_PER_MILLION_TOKENS[1]
+    )
+    first_read = (
+        tokens("triage_prompt_tokens") * TRIAGE_USD_PER_MILLION_TOKENS[0]
+        + (tokens("triage_completion_tokens") + tokens("triage_reasoning_tokens")) * TRIAGE_USD_PER_MILLION_TOKENS[1]
+    )
+    embedding = tokens("embedding_tokens") * max(EMBEDDING_USD_PER_MILLION_TOKENS.values())
+    return (judge + first_read + embedding) / 1_000_000
+
+
+def format_run_alerts(stats: RunStats) -> list[str]:
+    """Problems worth a delivered line even though the run carried on."""
+    alerts: list[str] = []
+    if stats.discovery_failures:
+        shown = stats.discovery_failures[:6]
+        more = len(stats.discovery_failures) - len(shown)
+        alerts.append(
+            "⚠️ RoleLens: discovery failed for " + ", ".join(shown)
+            + (f" and {more} more" if more else "") + "; the other sources were still read."
+        )
+    refusals = sorted({
+        key.split(":", 1)[-1] for key in stats.fallback_reasons
+        if key.split(":", 1)[-1].startswith("access_")
+    })
+    if refusals:
+        alerts.append(
+            f"⚠️ RoleLens: Vertex Gemini refused access ({', '.join(refusals)}), so the Azure "
+            "fallback was tried. Check the Vertex key, billing or credit."
+        )
+    if stats.embedding_failure:
+        alerts.append(
+            f"⚠️ RoleLens: embeddings unavailable ({stats.embedding_failure}); "
+            "jobs were ranked on the vocabulary alone this run."
+        )
+    if stats.budget_paused:
+        alerts.append(
+            f"⚠️ RoleLens: monthly budget reached (${stats.month_to_date_usd:.2f} of "
+            f"${stats.budget_usd:.2f}); judging paused with {stats.budget_waiting} jobs waiting. "
+            "Raise monthly_budget_usd or wait for the new month."
+        )
+    if stats.triage_failure:
+        alerts.append(
+            f"⚠️ RoleLens: the first-read model failed ({stats.triage_failure}), so the judge read the rest "
+            "of this run's ads at full price. Check triage_model in config.json."
+        )
+    return alerts
+
+
 def format_run_summary(
     evaluated: int,
     matches: int,
@@ -2755,36 +5410,35 @@ def format_run_summary(
     ceiling_reached: bool = False,
     selected: int = 0,
 ) -> str:
-    """One compact stats line per run.
+    """One compact stats line for a run with matches or a problem.
 
-    `evaluated` counts jobs the semantic matcher returned a usable result for,
-    never Platsbanken search hits or database upserts. `queued` counts frozen
-    snapshot jobs that ended the run without one and will be retried next time.
+    A run with neither returns "", so the scheduled job prints nothing and a
+    scheduler that delivers stdout sends nothing. `evaluated` counts jobs the
+    semantic matcher returned a usable result for, never discovered ads.
+    `queued` counts frozen snapshot jobs that ended the run without one.
     """
+    if not failed and not ceiling_reached and matches == 0:
+        return ""
     noun = "match" if matches == 1 else "matches"
     if failed:
         return (
-            f"\u26a0\ufe0f RoleLens: {evaluated} jobs checked \u00b7 {matches} {noun} "
-            f"\u00b7 {queued} pending after provider error."
+            f"⚠️ RoleLens: {evaluated} jobs checked · {matches} {noun} "
+            f"· {queued} pending after provider error."
         )
     if ceiling_reached:
         # The snapshot was truncated by the emergency ceiling, so this run is not a
         # complete picture of the market and must never be reported as one.
         return (
-            f"\u26a0\ufe0f RoleLens: candidate safety ceiling reached, {selected} selected "
-            f"\u00b7 {matches} {noun} \u00b7 additional jobs remain queued."
+            f"⚠️ RoleLens: candidate safety ceiling reached, {selected} selected "
+            f"· {matches} {noun} · additional jobs remain queued."
         )
-    if evaluated == 0 and matches == 0 and queued == 0:
-        # Only a genuinely empty tick reports nothing; a match carried over from
-        # an earlier run must still be described accurately.
-        return "\U0001f50e RoleLens: no new jobs found."
-    icon = "\U0001f3af" if matches else "\U0001f50e"
     if queued:
         return (
-            f"{icon} RoleLens: {evaluated} jobs checked \u00b7 {matches} {noun} "
-            f"\u00b7 {queued} queued for next run."
+            f"\U0001f3af RoleLens: {evaluated} jobs checked · {matches} {noun} "
+            f"· {queued} queued for next run."
         )
-    return f"{icon} RoleLens: {evaluated} jobs checked \u00b7 {matches} {noun}."
+    return f"\U0001f3af RoleLens: {evaluated} jobs checked · {matches} {noun}."
+
 
 def determine_run_status(partial_reasons: Sequence[str]) -> str:
     return "partial" if partial_reasons else "success"
@@ -2793,12 +5447,10 @@ def determine_run_status(partial_reasons: Sequence[str]) -> str:
 def run_pipeline(settings: Settings, *, fetch_only: bool, evaluate_only: bool) -> int:
     info = doctor(settings, require_key=not fetch_only)
     LOG.info(
-        "Profile %s, primary=%s fallback=%s",
-        info["profile_version"],
-        settings.primary_provider,
-        settings.fallback_provider,
+        "RoleLens %s, profile %s, primary=%s fallback=%s",
+        APP_VERSION, info["profile_version"], settings.primary_provider, settings.fallback_provider,
     )
-    http = HttpClient(retries=settings.http_retries, user_agent=f"{APP_NAME}/{APP_VERSION} personal-job-search")
+    http = HttpClient(retries=settings.http_retries, user_agent=f"{APP_NAME}/{APP_VERSION} (+{PROJECT_URL})")
     db = Database(settings.db_path)
     stats = RunStats()
     run_id = db.start_run()
@@ -2806,28 +5458,41 @@ def run_pipeline(settings: Settings, *, fetch_only: bool, evaluate_only: bool) -
     unresolved_count = 0
     try:
         if not evaluate_only:
-            jobs = fetch_jobs(JobSearchClient(http, settings), settings, stats)
-            persist_discovered_jobs(db, jobs.values(), settings, stats)
-            LOG.info(
-                "Discovery: %d hits, %d unique, %d stored, %d prefiltered",
-                stats.search_hits,
-                stats.unique_jobs,
-                stats.jobs_upserted,
-                stats.jobs_prefiltered,
-            )
+            discover(http, db, settings, stats)
 
         ceiling_reached = False
         snapshot_selected = 0
         if not fetch_only:
             matcher_profile, matcher_rules, version = load_profile_bundle(settings)
             secrets = load_secrets(settings.secrets_path)
+            # Rank before the snapshot is frozen, so every stored ad - from this
+            # run or an earlier `fetch` - competes for the evaluator.
+            rank_new_jobs(
+                db, settings, stats,
+                context=RankingContext.load(settings),
+                client=EmbeddingClient(settings, secrets, http),
+                enricher=EnrichmentClient(http),
+            )
+
+            # Judging stops for the month once the estimated spend reaches the
+            # budget. Ranked jobs stay queued and stored matches are still
+            # delivered; ranking itself keeps running for a few cents a day.
+            stats.budget_usd = settings.monthly_budget_usd
+            stats.month_to_date_usd = round(db.month_to_date_cost_usd(), 4)
+            stats.budget_paused = stats.month_to_date_usd >= settings.monthly_budget_usd
 
             # Freeze the candidate set for this run. It is taken once and never
             # re-queried, so a job discovered mid-run belongs to the next run and
             # this run stays auditable.
             ceiling = settings.max_candidates_per_run
-            candidates = db.pending_jobs(version, ceiling)
+            candidates = [] if stats.budget_paused else db.pending_jobs(version, ceiling)
             eligible_total = db.pending_count(version, respect_live_mode=True)
+            if stats.budget_paused:
+                stats.budget_waiting = eligible_total
+                LOG.warning(
+                    "Monthly budget reached: about $%.2f of $%.2f spent; %d job(s) wait unjudged",
+                    stats.month_to_date_usd, settings.monthly_budget_usd, eligible_total,
+                )
             # The ceiling is emergency protection, never a throughput limit. When it
             # bites, the run is explicitly incomplete rather than quietly truncated.
             ceiling_reached = len(candidates) >= ceiling and eligible_total > ceiling
@@ -2845,6 +5510,10 @@ def run_pipeline(settings: Settings, *, fetch_only: bool, evaluate_only: bool) -
                     "Repost suppressed before evaluation: %s is a repost of job %d",
                     row["source_job_id"], canonical,
                 )
+
+            snapshot = screen_before_judging(db, snapshot, settings, matcher_profile, version, stats)
+            if stats.rules_screened:
+                LOG.info("Settled without a model: %d blocked by the deterministic rules", stats.rules_screened)
 
             batches = list(
                 iter_batches(
@@ -2871,11 +5540,33 @@ def run_pipeline(settings: Settings, *, fetch_only: bool, evaluate_only: bool) -
                 deadline = time.monotonic() + settings.max_run_seconds
                 reserve = settings.gateway_timeout_seconds
 
+                # The first read settles the clear rejections; the judge reads the rest.
+                triage_deferred: list[sqlite3.Row] = []
+                if settings.triage_model:
+                    to_judge, triage_deferred = run_triage_pass(
+                        db, TriageClient(settings, secrets, matcher_profile), snapshot,
+                        profile_version=version, stats=stats,
+                        deadline=deadline, reserve_seconds=reserve,
+                    )
+                    batches = list(
+                        iter_batches(
+                            to_judge,
+                            max_jobs=settings.max_jobs_per_batch,
+                            max_chars=settings.max_prompt_chars,
+                            max_job_description_chars=settings.max_job_description_chars,
+                        )
+                    )
+                    LOG.info(
+                        "First read: %d settled, %d to the judge in %d batch(es), %d deferred",
+                        stats.triage_settled, len(to_judge), len(batches), len(triage_deferred),
+                    )
+
                 outcome = run_batch_pass(
                     db, primary, fallback, batches,
                     profile_version=version, stats=stats,
                     deadline=deadline, reserve_seconds=reserve,
                 )
+                outcome.deferred.extend(triage_deferred)
 
                 # Completeness matters more than punctuality, so unresolved IDs get
                 # exactly one more attempt after the normal pass. Never recursive.
@@ -2937,19 +5628,21 @@ def run_pipeline(settings: Settings, *, fetch_only: bool, evaluate_only: bool) -
             elif duplicate_cards:
                 db.mark_notifications_emitted([int(row["evaluation_id"]) for row, _ in duplicate_cards])
 
-            # Exactly one compact stats line per run, after any detailed matches.
-            print(
-                format_run_summary(
-                    stats.evaluated,
-                    stats.notified,
-                    # Frozen-snapshot jobs that ended the run without a result.
-                    max(0, stats.pending_selected - stats.evaluated),
-                    failed=bool(partial_reasons),
-                    ceiling_reached=ceiling_reached,
-                    selected=snapshot_selected,
-                ),
-                flush=True,
+            for alert in format_run_alerts(stats):
+                print(alert, flush=True)
+            # One compact stats line after any detailed matches, and only when the
+            # run has matches or a problem: a quiet run prints nothing at all.
+            summary = format_run_summary(
+                stats.evaluated,
+                stats.notified,
+                # Frozen-snapshot jobs that ended the run without a result.
+                max(0, stats.pending_selected - stats.evaluated),
+                failed=bool(partial_reasons),
+                ceiling_reached=ceiling_reached,
+                selected=snapshot_selected,
             )
+            if summary:
+                print(summary, flush=True)
             LOG.info("Live pending after this run: %d", remaining_live)
 
         run_status = determine_run_status(partial_reasons)
@@ -2988,7 +5681,7 @@ def select_historical_candidates(
     *,
     today: dt.date,
 ) -> tuple[list[sqlite3.Row], dict[str, int]]:
-    """Freeze one historical recovery snapshot, newest exclusions counted."""
+    """Freeze one historical recovery snapshot, with exclusions counted."""
     rows = db.historical_pending(profile_version, settings.max_candidates_per_run, today=today)
     excluded: dict[str, int] = {}
     kept: list[sqlite3.Row] = []
@@ -3014,7 +5707,7 @@ def run_backfill(settings: Settings, *, dry_run: bool, limit: int | None = None)
 
     Deliberately has no discovery step and no delivery step. It writes
     evaluations and nothing else: notification state belongs to
-    `backfill-report`, so running this over SSH can never consume a match that
+    `backfill-report`, so running this by hand can never consume a match that
     was never actually delivered anywhere.
     """
     info = doctor(settings, require_key=not dry_run)
@@ -3169,16 +5862,16 @@ def run_backfill_report(settings: Settings, *, limit: int | None = None) -> int:
 
         waiting = db.historical_counts(version, today=today).get("historical_matches_awaiting_delivery", 0)
         if not emitted and not waiting:
-            print("\u2705 Historical recovery: all worthwhile open matches delivered.", flush=True)
+            print("✅ Historical recovery: all worthwhile open matches delivered.", flush=True)
         elif waiting:
             noun = "match" if waiting == 1 else "matches"
             print(
-                f"\U0001f3af Historical recovery: {len(emitted)} delivered \u00b7 {waiting} {noun} still waiting.",
+                f"\U0001f3af Historical recovery: {len(emitted)} delivered · {waiting} {noun} still waiting.",
                 flush=True,
             )
         else:
             print(
-                f"\u2705 Historical recovery: {len(emitted)} delivered \u00b7 none still waiting.",
+                f"✅ Historical recovery: {len(emitted)} delivered · none still waiting.",
                 flush=True,
             )
         return 0
@@ -3205,19 +5898,22 @@ def backfill_status(settings: Settings) -> dict[str, Any]:
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="RoleLens: semantic Swedish job discovery for script-only cron.",
+        prog="rolelens.py",
+        description="RoleLens: semantic Swedish job discovery for script-only schedulers.",
     )
+    parser.add_argument("--version", action="version", version=f"RoleLens {APP_VERSION}")
     parser.add_argument(
         "--home",
         type=Path,
         default=Path(os.getenv("ROLELENS_HOME", DEFAULT_HOME)),
-        help="RoleLens home directory (default: ~/.rolelens)",
+        help="RoleLens home directory (default: ~/.rolelens, or ROLELENS_HOME)",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logs on stderr")
+    # Not required: a scheduler that runs the script without arguments gets `run`.
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("run", help="Fetch, evaluate and emit new matches (default)")
-    sub.add_parser("fetch", help="Fetch/store jobs only, no LLM call")
-    sub.add_parser("evaluate", help="Evaluate already-stored pending jobs only")
+    sub.add_parser("run", help="Discover, rank, evaluate and emit new matches (default)")
+    sub.add_parser("fetch", help="Discover and store jobs only; no model call")
+    sub.add_parser("evaluate", help="Rank and evaluate already-stored jobs only")
     sub.add_parser("doctor", help="Validate local configuration without network calls")
     sub.add_parser("status", help="Show local database counters")
     sub.add_parser(
@@ -3264,8 +5960,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(doctor(settings, require_key=True), indent=2, ensure_ascii=False))
             return 0
         if command == "status":
-            matcher_profile, matcher_rules, version = load_profile_bundle(settings)
-            del matcher_profile, matcher_rules
+            _, _, version = load_profile_bundle(settings)
             db = Database(settings.db_path)
             try:
                 print(json.dumps(db.status(version), indent=2, ensure_ascii=False))
@@ -3289,12 +5984,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 before = db.get_meta("live_since")
                 live_since = db.activate_live_mode()
-                state = "already active" if before else "activated"
                 print(
                     json.dumps(
                         {
                             "mode": "live",
-                            "state": state,
+                            "state": "already active" if before else "activated",
                             "live_since": live_since,
                             "note": "Future evaluate/run commands select only jobs first seen or changed at/after this cutoff.",
                         },

@@ -2,8 +2,10 @@
 
 **Find work that fits, beyond the job title.**
 
-RoleLens is a lightweight semantic job-discovery agent that evaluates real role
-fit using LLMs, deterministic policies, and a durable SQLite queue.
+RoleLens is a lightweight semantic job-discovery agent for the Swedish market.
+It reads every new vacancy on Platsbanken and on the company career sites you
+choose, ranks them against your profile, and lets an LLM judge only the ones
+worth reading — then a deterministic policy layer decides what reaches you.
 
 Keyword alerts fail in both directions. They flood you with vacancies that
 happen to contain the word "engineer", and they hide the role that describes
@@ -11,24 +13,23 @@ exactly your job under a title you never thought to search for. RoleLens reads
 the advertisement instead of matching its title.
 
 ```text
-Platsbanken (Arbetsförmedlingen JobSearch API)
-    ↓
-fetch + normalize
-    ↓
-SQLite durable queue
-    ↓
-new/changed jobs
-    ↓
-LLM semantic evaluation
-    ↓
-deterministic policy layer
-    ↓
-ranked notifications
+Platsbanken (JobStream + JobSearch)      Company career sites
+                  \                         /
+                   fetch, normalise, store (SQLite)
+                              ↓
+          rank every new ad against your profile   ← no model tokens spent
+          (role vocabulary + embeddings + JobTech enrichment)
+                              ↓
+          top share only → deterministic screening  ← no model tokens spent
+                              ↓
+          optional cheap first read → LLM judge
+                              ↓
+          deterministic policy layer → ranked notifications
 ```
 
-It runs as a scheduled script on a small VPS. No agent loop, no browser
-automation, no vector database, no Redis, no Docker, no queue broker, and no
-third-party Python package at runtime.
+It runs as one scheduled Python script on a small VPS. No agent loop, no
+browser automation, no vector database, no Redis, no Docker, no queue broker,
+and no third-party Python package at runtime.
 
 ---
 
@@ -36,7 +37,8 @@ third-party Python package at runtime.
 
 RoleLens evaluates the actual work behind a vacancy, explains why it may fit,
 highlights gaps and uncertainties, and sends the strongest opportunities to your
-preferred channel.
+preferred channel. These are real cards, delivered to Telegram by
+[Hermes Agent](#running-with-hermes-agent).
 
 ### Strong match
 
@@ -80,36 +82,52 @@ blocks you — and that is information a single blended number destroys.
 
 ## How a job becomes a notification
 
-1. **Discovery.** RoleLens runs many small searches against the
-   Arbetsförmedlingen JobSearch API. Discovery costs nothing and consumes zero
-   LLM tokens, so it is deliberately over-inclusive: it would rather retrieve a
-   somewhat irrelevant advertisement than miss a hidden-fit role.
-2. **Normalization and persistence.** Each hit is normalized into a job record
-   and upserted into SQLite under a `UNIQUE(source, source_job_id)` key. A
-   SHA-256 content hash of the meaningful fields decides whether an advertisement
-   has genuinely changed.
-3. **Snapshot selection.** Jobs with no evaluation for the current content hash
-   *and* the current profile version are pending. The run takes them **once**, as
-   a frozen snapshot that is never re-queried, so a vacancy discovered mid-run
-   belongs to the next run and this run stays auditable. Reposts of an
-   already-evaluated vacancy are suppressed before they can cost a model call.
-4. **Semantic evaluation.** The whole snapshot is evaluated, in sequential
-   batches of at most 10, with a JSON-schema-constrained output contract. The
-   candidate profile is sent once per batch, not once per job. There is no
-   per-run job cap: batch size is bounded, throughput is not.
-5. **Validation.** Every requested `source_job_id` must come back exactly once.
-   A batch that comes back short is a *completeness gap*, not a failure — its
-   valid rows are saved and later batches continue. Omitted IDs get exactly one
-   bounded cleanup pass at the end of the run.
-6. **Deterministic policy layer.** The model's own `decision` field is never
-   trusted. RoleLens applies narrow, auditable rules to the model output and
-   then derives the decision itself from validated scores and blockers.
-7. **Notification.** Only after every batch has completed are matches ranked
-   **globally** and printed to stdout, deduplicated, followed by exactly one
-   compact run-summary line. Ranking after the fact is what stops the strongest
-   opportunity being buried because it happened to appear late in the queue.
-   Operational logs go to stderr, so stdout can be delivered verbatim to a chat
-   channel by any scheduler.
+1. **Discovery — free.** Three sources, each optional:
+   - **JobStream** returns every Platsbanken ad added or changed since the last
+     run, so no vacancy is missed for using a word you did not search for.
+   - **JobSearch** keyword queries reach the open backlog a fresh installation
+     has never seen.
+   - **Career sites.** Built-in collectors read the public feeds of Teamtailor,
+     Varbi, Greenhouse, Lever, Ashby, SmartRecruiters, Workday and SAP
+     SuccessFactors sites. Many employers publish vacancies there that never
+     reach Platsbanken. See [docs/career-sites.md](docs/career-sites.md).
+
+   A failing source is reported and the others still run.
+2. **Normalisation and persistence.** Each ad becomes a job record, upserted
+   into SQLite under a `UNIQUE(source, source_job_id)` key. A SHA-256 hash of
+   the meaningful fields decides whether an ad has genuinely changed. A
+   career-site posting already stored from Platsbanken is left out.
+3. **Ranking — no model tokens.** Every new or edited ad is scored three ways:
+   a weighted role vocabulary built from your profile, the embedding similarity
+   between the ad and the closest section of your matcher profile, and the
+   competencies Arbetsförmedlingen's JobAd Enrichments API finds the ad
+   requesting. Reciprocal rank fusion combines them, and only the top share of
+   recent ads (15% by default) goes on — plus a small random sample of the rest,
+   so a ranking miss is still found and visible. If embeddings fail, ranking
+   falls back to the vocabulary with a wider share and says so.
+4. **Snapshot selection.** Selected ads without an evaluation for their current
+   content and profile version are pending. The run takes them **once**, as a
+   frozen snapshot, and suppresses reposts of vacancies it has already judged.
+5. **Deterministic screening — no model tokens.** Ads the rules would block
+   anyway — a management title or years of experience far beyond your dated
+   roles, a student role in a full-time search, a nationality you do not hold,
+   mandatory Swedish above your level — are stored with that reason.
+6. **First read (optional).** A cheap model reads the rest with a compact
+   candidate card and settles only confident rejections well below a match.
+   Anything it passes, doubts or fails to answer goes to the judge, so it can
+   save money but never cost a match.
+7. **Semantic evaluation.** The judge evaluates in batches of at most 10 with a
+   JSON-schema-constrained output contract. Every requested ID must come back
+   exactly once; a short batch is a completeness gap with one bounded cleanup
+   pass. An ad whose score lands near the card line is judged a second time and
+   decided on the mean, which halves run-to-run noise where it matters.
+8. **Deterministic policy layer.** The model's own `decision` field is never
+   trusted. Narrow, auditable rules are applied to the model output and the
+   decision is derived from validated scores and blockers.
+9. **Notification.** Only after every batch has completed are matches ranked
+   **globally**, deduplicated and printed to stdout, followed by one compact
+   summary line. A run with no match and no problem prints nothing at all.
+   Operational logs go to stderr.
 
 There is no auto-apply. RoleLens tells you what to look at; you decide what to
 do about it.
@@ -118,9 +136,8 @@ do about it.
 
 ## Quick start
 
-Requires Python 3.11+ on Linux or macOS. The application uses `fcntl` for its
-run lock, so it does not run on Windows without modification. There is nothing
-to `pip install`.
+Requires Python 3.11+. There is nothing to `pip install`. The installer needs a
+POSIX shell (Linux, macOS, WSL); the script itself also runs on Windows.
 
 ```bash
 git clone https://github.com/Aminhashemi-su/RoleLens.git
@@ -131,18 +148,19 @@ cd RoleLens
 missing from the shipped examples. It never overwrites a file you already have.
 
 ```bash
-chmod +x install.sh
 ./install.sh
 ```
 
 ```text
 ~/.rolelens/
-  config.json                      <- from config.example.json
-  secrets.env                      <- from secrets.env.example, mode 600
-  profile/career_profile.json      <- from career_profile.example.json
-  profile/matcher_profile.json     <- from matcher_profile.example.json
-  profile/search_lenses.json       <- from search_lenses.example.json
-  profile/matcher_rules_v1_1.json
+  config.json                        <- sources, career sites, limits
+  secrets.env                        <- provider credentials, mode 600
+  profile/matcher_profile.json       <- sent to the model; its sections rank jobs
+  profile/role_vocabulary.json       <- weighted role terms that rank jobs
+  profile/knowledge_catalogue.json   <- dated roles and skill levels (optional)
+  profile/career_profile.json        <- your local evidence base, never sent anywhere
+  profile/search_lenses.json         <- documents your search intent
+  profile/matcher_rules_v1_1.json    <- the scoring contract
   data/
 ~/.local/scripts/rolelens.py
 ```
@@ -156,51 +174,38 @@ from the checkout, and still never touches `secrets.env`.
 example candidate, so RoleLens will happily match jobs for someone who does not
 exist until you edit it.
 
-```bash
-$EDITOR ~/.rolelens/profile/matcher_profile.json   # the one sent to the model
-$EDITOR ~/.rolelens/profile/career_profile.json    # your local evidence base
-$EDITOR ~/.rolelens/config.json                    # search terms and locations
-```
+- `matcher_profile.json` matters most. It is sent to the model on every run, and
+  its descriptive sections (`candidate_core`, `strong_capabilities`,
+  `role_families_to_recognize_semantically`, …) are what ads are ranked against.
+  List work you do not want under `out_of_scope_work`.
+- `role_vocabulary.json` holds weighted terms — English and Swedish — for the
+  work you do. Build it from your own profile, not from ads you have already
+  judged. Negative weights mark professions you cannot do.
+- `knowledge_catalogue.json` is optional. Its dated `professional_experience`
+  entries let the engine settle years of experience and seniority itself; skills
+  marked `not_evidenced` are treated as absent.
+- Set your Swedish level and, if you want the engine to decide nationality
+  requirements, your eligibility — see [Language proficiency](#language-proficiency)
+  and [Work eligibility](#work-eligibility).
 
-`matcher_profile.json` is the one that matters most: it is the compact profile
-actually sent to the model on every run. `career_profile.json` is your fuller
-evidence base, kept locally so the compact profile can be derived from something
-concrete — RoleLens never sends it to a provider.
-
-**Set your language level** while you are in there:
-
-```json
-"constraints": { "swedish": "A2, progressing" }
-```
-
-See [Language proficiency](#language-proficiency) below. This value is
-configuration, not code — nothing in `rolelens.py` assumes a level.
-
-**3. Add provider credentials.**
-
-```bash
-$EDITOR ~/.rolelens/secrets.env
-chmod 600 ~/.rolelens/secrets.env
-```
+**3. Add provider credentials** to `~/.rolelens/secrets.env` (mode 600). The
+Vertex key pays for the judge, the embeddings and the optional first read.
 
 **4. Check the installation, then spend money deliberately.**
 
 ```bash
-python3 ~/.local/scripts/rolelens.py doctor            # config only, no network, no cost
-python3 ~/.local/scripts/rolelens.py --verbose fetch    # discovery only, zero LLM cost
-python3 ~/.local/scripts/rolelens.py status             # local counters
-python3 ~/.local/scripts/rolelens.py --verbose evaluate  # first step that calls a provider
+python3 ~/.local/scripts/rolelens.py doctor             # config only, no network, no cost
+python3 ~/.local/scripts/rolelens.py --verbose fetch    # discovery only, zero model cost
+python3 ~/.local/scripts/rolelens.py status             # local counters, per source
+python3 ~/.local/scripts/rolelens.py --verbose evaluate # first step that calls a provider
 ```
 
-`doctor` tells you exactly what is still outstanding. It reports
-`unedited_example_profiles` while the profile is still the shipped example,
-`missing_credentials` until `secrets.env` is filled in, the resolved
-`candidate_swedish_level`, and `ready: true` once both are done. It makes no
-provider calls and costs nothing.
+`doctor` reports `unedited_example_profiles` while any profile file is still the
+shipped example, `missing_credentials` until `secrets.env` is filled in, the
+discovery sources and ranking it will use, and `ready: true` once both are done.
 
-**5. Switch from backlog to live.** The first `fetch` stores a large historical
-backlog. When you are ready to stop evaluating it and only see new or changed
-vacancies:
+**5. Switch from backlog to live.** The first runs store a backlog. When you are
+ready to see only new or changed vacancies:
 
 ```bash
 python3 ~/.local/scripts/rolelens.py activate
@@ -208,70 +213,164 @@ python3 ~/.local/scripts/rolelens.py activate
 
 ---
 
+## Running on a schedule
+
+RoleLens is a plain script: a scheduler runs it, and whatever it prints is the
+report. Run with no arguments it does a full `run`. Two to four runs a day is
+plenty.
+
+```cron
+30 7,15 * * *  /usr/bin/python3 $HOME/.local/scripts/rolelens.py 2>>$HOME/rolelens.log
+```
+
+A quiet run prints nothing, so cron sends no mail and a chat scheduler sends no
+message. Matches, alerts (a failing source, a provider refusing the account, the
+monthly budget) and a non-zero exit always produce output.
+
+The scheduler's per-task timeout must exceed `max_run_seconds` plus one
+`gateway_timeout_seconds` — at least 3600 seconds with the defaults. A run killed
+from outside never marks its notifications, so the work is simply repeated.
+
+### Running with Hermes Agent
+
+[Hermes Agent](https://hermes-agent.nousresearch.com/) has a cron scheduler with
+[script-only jobs](https://hermes-agent.nousresearch.com/docs/guides/cron-script-only):
+no LLM is involved, the script runs on a timer, and its stdout is delivered
+verbatim to Telegram, Discord, Slack or Signal. That is exactly RoleLens's
+contract, and it is how the cards above were delivered.
+
+**1. Install into the Hermes scripts folder.** Hermes only runs cron scripts
+from `~/.hermes/scripts/`:
+
+```bash
+ROLELENS_SCRIPTS_HOME="$HOME/.hermes" ./install.sh
+```
+
+Configure `~/.rolelens/` as in the quick start, and check it by hand:
+
+```bash
+python3 ~/.hermes/scripts/rolelens.py doctor
+python3 ~/.hermes/scripts/rolelens.py --verbose run
+```
+
+**2. Create the job.**
+
+```bash
+hermes cron create "30 7,15 * * *" --no-agent --script rolelens.py --deliver telegram --name rolelens
+```
+
+`--deliver telegram` sends to your Telegram home channel; use
+`telegram:<chat_id>` for a specific chat or group.
+
+**3. Operate it.**
+
+```bash
+hermes cron list            # find the job id
+hermes cron run <job_id>    # one run now, to see it deliver
+hermes cron pause <job_id>
+hermes cron resume <job_id>
+```
+
+What makes this work reliably:
+
+- **No arguments.** Hermes runs the script without arguments, which RoleLens
+  treats as `run`.
+- **Its own credentials.** Hermes does not pass provider credentials to cron
+  scripts. RoleLens reads `~/.rolelens/secrets.env` itself.
+- **Silence is a feature.** Hermes delivers nothing for empty stdout, and
+  RoleLens prints nothing when there is no match and no problem.
+- **Failures are loud.** A non-zero exit becomes a Hermes error alert; partial
+  provider failures exit 0 and say so in the summary line instead.
+- **Timeout.** Hermes allows script jobs 3600 seconds by default
+  (`cron.script_timeout_seconds`), which fits the default `max_run_seconds` of
+  3000. Raise both together if you raise one.
+- **One run at a time.** A run that overlaps a slow previous one exits quietly on
+  the run lock.
+
+Historical recovery (`backfill`, `backfill-report`) is meant to be run by hand,
+not scheduled.
+
+---
+
 ## CLI
 
 | Command | What it does |
 |---|---|
-| `run` | Fetch, evaluate, emit new matches. The default. |
-| `fetch` | Discovery and persistence only. No LLM call, no cost. |
-| `evaluate` | Evaluate already-stored pending jobs only. |
+| `run` | Discover, rank, evaluate, emit new matches. The default. |
+| `fetch` | Discovery and persistence only. No model call, no cost. |
+| `evaluate` | Rank and evaluate already-stored jobs only. |
 | `doctor` | Validate local configuration and credentials without network calls. |
-| `status` | Print database counters: totals, pending, mode, live cutoff. |
+| `status` | Database counters: jobs per source, ranking state, pending, month-to-date cost. |
 | `activate` | Freeze the historical backlog; future runs see only new/changed jobs. |
+| `backfill`, `backfill-status`, `backfill-report` | Historical recovery — see [docs/operations.md](docs/operations.md). |
 
-Global flags: `--home PATH` (default `~/.rolelens`, or `ROLELENS_HOME`)
-and `--verbose`.
+Global flags: `--home PATH` (default `~/.rolelens`, or `ROLELENS_HOME`),
+`--verbose`, `--version`.
 
 Exit codes: `0` success or recoverable partial, `2` expected operational failure
-(bad configuration, permanent provider failure, total discovery failure), `1`
-unexpected failure, `130` interrupted.
+(bad configuration, permanent provider failure, every discovery source failed),
+`1` unexpected failure, `130` interrupted.
 
 ---
 
 ## Configuration
 
-`config.json` — see `config.example.json` for a working starting point.
+`config.json` — see `config.example.json` for a working starting point. Unknown
+keys are ignored; invalid values fail `doctor` with a message naming the key.
+
+**Discovery**
 
 | Key | Meaning |
 |---|---|
-| `search_terms`, `location_terms` | Cross-producted into the discovery queries. |
-| `include_unlocated_searches` | Also run each term without a location. |
-| `search_limit` | Hits per query, capped at 100. |
-| `max_candidates_per_run` | **Emergency ceiling** on snapshot size (default 300, cap 500). Not a throughput cap — see below. |
-| `max_jobs_per_batch` | Jobs per model call (default and cap 10). |
-| `max_run_seconds` | **Emergency** wall-clock budget (default 3000). A batch only starts if its worst case fits. |
-| `max_prompt_chars`, `max_job_description_chars` | Prompt size guardrails. |
-| `max_notifications_per_run` | Cards emitted per run. |
-| `preferred_locations`, `high_signal_title_terms` | Inputs to the cheap discovery score. |
-| `northern_exclusions` | Locations pre-filtered out unless the role is fully remote. |
-| `jobsearch_timeout_seconds`, `gateway_timeout_seconds`, `http_retries` | Transport limits. |
+| `use_jobstream` | Read the complete Platsbanken change feed. Default `true`. |
+| `jobstream_lookback_hours`, `jobstream_max_window_hours` | First-run replay window, and the widest window ever requested after downtime. |
+| `search_terms`, `location_terms`, `include_unlocated_searches` | JobSearch keyword queries, cross-producted. Empty `search_terms` turns JobSearch off. |
+| `search_limit`, `query_delay_ms` | Hits per query (max 100), and the pause between requests. |
+| `career_sites` | Company career sites to read. See [docs/career-sites.md](docs/career-sites.md). |
+| `career_site_max_details` | Detail pages fetched per site per run, on platforms whose listing has no description. |
+| `preferred_locations`, `northern_exclusions` | Tie-break order, and locations dropped unless the role is fully remote. |
 
-Most of these are cost guardrails, not semantic rejection rules. Anything not
-evaluated in a run stays pending for the next one.
+**Ranking and screening**
 
-`max_candidates_per_run` and `max_run_seconds` are different: they are
-**emergency valves, not throughput caps**. One bounds how much of the pending
-queue a single run will hold in memory, the other bounds wall clock. A normal
-run never reaches either. When the candidate ceiling *is* reached the run says
-so explicitly in its summary, because a truncated snapshot is not a complete
-picture of the market and must not be reported as one.
+| Key | Meaning |
+|---|---|
+| `evaluate_top_share` | Share of recent ads the evaluator reads (default 0.15). |
+| `degraded_top_share` | Share used when embeddings were unavailable (default 0.30). |
+| `explore_share` | Random share of the rest judged anyway (default 0.03). |
+| `use_enrichment` | Use JobTech's enrichment as a third ranking order. |
+| `ranking_reference_days` | Window of recent ads a percentile is taken over. |
+| `embedding_model`, `embedding_batch_size` | Vertex embedding model and request size. |
+| `exclude_student_roles` | Treat internships, theses and student jobs as out of scope. |
+
+**Judging, cost and limits**
+
+| Key | Meaning |
+|---|---|
+| `triage_model` | Cheap first-read model, e.g. `gemini-2.5-flash-lite`. Empty sends every ad to the judge. |
+| `triage_thinking_budget`, `triage_batch_size` | First-read thinking tokens (0 or 512–24576) and ads per call. |
+| `monthly_budget_usd` | Estimated spend per UTC month after which judging pauses; ranking and delivery continue. |
+| `max_candidates_per_run` | **Emergency ceiling** on snapshot size (default 300, cap 500). |
+| `max_jobs_per_batch` | Jobs per judge call (default and cap 10). |
+| `max_run_seconds` | **Emergency** wall-clock budget (default 3000). |
+| `max_notifications_per_run` | Cards emitted per run; the rest wait for the next. |
+| `*_timeout_seconds`, `http_retries` | Transport limits. |
+
+`max_candidates_per_run` and `max_run_seconds` are **emergency valves, not
+throughput caps**. A normal run reaches neither; when one bites, the run says so
+explicitly and the remainder stays queued.
 
 ### Language proficiency
 
 The candidate's proficiency lives in `matcher_profile.json`, never in the code:
 
 ```json
-"constraints": {
-  "swedish": "A2, progressing"
-}
+"constraints": { "swedish": "A2, progressing" }
 ```
 
 Accepted values are CEFR levels (`none`, `A1`–`C2`) or plain words that map onto
 them: `beginner`/`basic` → A1, `intermediate` → B1, `upper intermediate` → B2,
-`advanced`/`professional`/`fluent` → C1, `native` → C2. Case does not matter, and
-surrounding prose is fine — `"A2, progressing"` and `"B1 (intermediate)"` both
-work. An explicit CEFR token always wins, so `"A2, working towards fluent"` is
-read as A2.
+`advanced`/`professional`/`fluent` → C1, `native` → C2. An explicit CEFR token
+always wins, so `"A2, working towards fluent"` is read as A2.
 
 When an advertisement **explicitly requires** professional, fluent or advanced
 Swedish, the policy layer resolves it against your configured level:
@@ -283,23 +382,13 @@ Swedish, the policy layer resolves it against your configured level:
 | B1, A2, A1, none | **unmet** — hard blocker, `opportunity_score` capped at 49 |
 | missing or unparseable | **unknown** — no blocker, no cap, never "unmet" |
 
-C1 is the threshold for "professional working proficiency". B2 is deliberately
-penalised rather than hard-blocked: it is close enough that auto-rejecting risks
-hiding a good role, and a hidden role costs far more here than a wasted click.
-
-Unknown is a state of its own. A missing level is never read as "none" and never
-becomes "unmet" — the requirement stays unresolved and `doctor` tells you the
-level is unspecified.
-
 None of this applies to a merely *preferred* Swedish requirement, or to an
-advertisement that simply happens to be written in Swedish. Those are never
-blockers at any level.
+advertisement that simply happens to be written in Swedish.
 
 ### Work eligibility
 
-Nationality is the one requirement no amount of role fit can rescue, and it is
-worded almost identically to a requirement an existing permit already satisfies.
-Four optional fields let the policy layer tell the two apart:
+Four optional fields let the policy layer tell a nationality requirement from a
+right-to-work requirement an existing permit already satisfies:
 
 ```json
 "constraints": {
@@ -310,104 +399,69 @@ Four optional fields let the policy layer tell the two apart:
 }
 ```
 
-| Field | Effect when `"no"` |
-|---|---|
-| `swedish_citizenship` | Gates the whole feature. Absent, none of this applies. |
-| `eu_citizenship` | An EU/EEA nationality demand becomes a hard blocker too. |
-| `permanent_residence` | A permanent-residence demand becomes a hard blocker. |
-| `work_permit` | Set it to `"yes"` to mark right-to-work requirements **met**. |
-
-**Leaving `swedish_citizenship` out is a real choice, not an oversight.** While
-it is absent, an explicit citizenship demand is preserved as `unknown` and the
-role is still delivered for you to check yourself. Turning "we do not know" into
-"you are rejected" silently loses roles, so the engine will not do it on a guess.
-Once you answer, it stops asking.
-
-What then decides the outcome is what the advertisement actually demands:
+**Leaving `swedish_citizenship` out is a real choice.** While it is absent, an
+explicit citizenship demand is preserved as `unknown` and the role is still
+delivered for you to check. Once you answer, the engine decides:
 
 | Advertisement says | With the profile above |
 |---|---|
 | "requires Swedish citizenship" | **hard blocker** |
-| "citizenship may be required for vetting" | **hard blocker** — a conditional demand cannot be satisfied either |
+| "citizenship may be required for vetting" | **hard blocker** |
 | "Swedish citizen **or** valid EU work permit" | **met** — a permit route is offered |
 | "we cannot offer visa sponsorship" | **met** — the permit is already held |
 
-A background or security *screening* is not a citizenship requirement and never
-becomes one on its own. Where an advertisement demands a clearance without tying
-it to nationality, that stays `unknown`, exactly as before.
+Ordinary background screening is never treated as a citizenship requirement.
 
-### Scheduler timeout
+### Seniority from the knowledge catalogue
 
-Whatever runs RoleLens on a schedule — cron, a systemd timer, a CI schedule, a
-task runner — its per-task timeout **must be greater than `max_run_seconds`
-plus one `gateway_timeout_seconds` of reserve**. With the defaults that is
-3000 + 150, so allow at least 3600 seconds.
+With a dated `knowledge_catalogue.json`, the engine counts your years of
+experience (overlapping roles once) and reads the advertisement's own words:
 
-A run killed externally before its internal budget expires never gets to emit
-its summary or mark its notifications, so the work is simply repeated on the
-next tick. RoleLens bounds its own runtime; the scheduler only needs to let it
-finish.
+| Advertisement | Outcome |
+|---|---|
+| Requires 2+ more years of experience than you have | hard blocker |
+| Requires a little more than you have | capped at a stretch |
+| Senior, lead, principal or architect title, under 5 years | capped at a stretch |
+| Head of, director, chief or team-leader title, under 5 years | hard blocker |
+| Years demanded in one named field you have not worked in | capped at a stretch, never removed |
+| Junior, graduate or "early career" wording | none of the above |
 
-### Environment variables
-
-RoleLens reads credentials from `secrets.env` inside its home directory, not
-from the process environment, because script-only scheduled jobs typically do
-not inherit provider credentials from the scheduler.
-
-| Variable | Required | Purpose |
-|---|---|---|
-| `VERTEX_GEMINI_API_KEY` | yes | Primary evaluator. |
-| `VERTEX_GEMINI_MODEL` | yes | Primary model id, e.g. `gemini-3.8-flash`. |
-| `AZURE_OPENAI_API_KEY` | yes | Transport fallback. |
-| `AZURE_OPENAI_BASE_URL` | yes | Azure deployment endpoint. |
-| `AZURE_OPENAI_DEPLOYMENT` | yes | Azure deployment name. |
-| `AI_GATEWAY_API_KEY` | no | Benchmark tooling only; never used by production routing. |
-
-`doctor` fails if any required value is missing. Keep the file at mode `600`.
+Without a catalogue, nothing here decides anything.
 
 ---
 
 ## Architecture
 
-Full detail, including diagrams, is in [docs/architecture.md](docs/architecture.md).
-Day-to-day commands, scheduling and historical recovery are in
-[docs/operations.md](docs/operations.md).
-The short version:
+Full detail is in [docs/architecture.md](docs/architecture.md); day-to-day
+operation, scheduling and historical recovery are in
+[docs/operations.md](docs/operations.md). The short version:
 
-- **Retrieval** — Arbetsförmedlingen JobSearch, many cheap queries, no LLM.
-- **Persistence** — one SQLite file. `jobs`, `evaluations`, `notifications`,
-  `runs`, `job_fingerprints`, `meta`. WAL journal, foreign keys on.
-- **Provider routing** — Gemini is primary. Azure is a **transport-only**
-  fallback, called at most once per batch and only for a transport, timeout,
-  rate-limit, unavailable or temporary 5xx failure. A successful HTTP 200 with
-  malformed content never triggers the fallback, because a second provider
-  cannot fix a semantic problem.
-- **Structured output** — a JSON schema is enforced natively by both providers,
-  and completeness is verified afterwards regardless.
-- **Deterministic policy layer** — the part that decides. See below.
-- **Completeness** — a run evaluates its whole frozen snapshot in sequential
-  batches of at most 10, then ranks globally and delivers once. A short batch is
-  a completeness gap, not a failure, and gets one bounded cleanup pass.
-- **Recovery** — durable pending queue; pending-ness is derived from state, so
-  an interrupted run leaves the queue correct.
+- **Retrieval** — JobStream, JobSearch and career-site collectors; no model.
+- **Persistence** — one SQLite file: `jobs` (with ranking columns), `evaluations`,
+  `notifications`, `runs`, `job_fingerprints`, `profile_embeddings`, `meta`.
+- **Ranking** — role vocabulary, profile embeddings and JobTech enrichment fused
+  with reciprocal rank fusion; the profile is embedded once per version.
+- **Provider routing** — Gemini is primary. Azure is called at most once per
+  batch when Gemini is unreachable, rate-limited, temporarily failing or refuses
+  the account. A successful HTTP 200 with malformed content never triggers it.
+- **Deterministic policy layer** — the part that decides.
+- **Completeness** — a run evaluates its whole frozen snapshot, ranks globally
+  and delivers once; pending-ness is derived from state, so an interrupted run
+  leaves the queue correct.
 
 ### Why the model does not get the last word
 
-The model returns scores and blockers. RoleLens then applies a small set of
-narrow, auditable rules before deriving the decision itself:
+The model returns scores and blockers. RoleLens then applies narrow, auditable
+rules before deriving the decision itself:
 
-- An advertisement *written* in Swedish is not a Swedish-language requirement.
-- Only an explicit mandatory fluent/professional Swedish requirement is a hard
-  blocker; "Swedish is a merit" is not, and an explicit "Swedish is not
-  required" overrides any mandatory-sounding phrase elsewhere in the same ad.
-- Ordinary background screening is not a citizenship or clearance requirement.
-- An explicit citizenship or clearance requirement that the candidate's evidence
-  does not resolve stays **unknown** — it never silently becomes *unmet*.
-- A tenure requirement with no supporting evidence is unknown, not failed.
+- An advertisement *written* in Swedish is not a Swedish-language requirement;
+  "Swedish is a merit" is not a blocker; an explicit "Swedish is not required"
+  overrides any mandatory-sounding phrase.
+- Background screening is not a citizenship or clearance requirement, and an
+  unresolved explicit requirement stays **unknown** — never silently *unmet*.
+- Nationality and seniority are settled from the profile and the catalogue.
 - Any genuinely unmet mandatory requirement becomes a hard blocker, and a hard
   blocker always suppresses notification.
-
-Only then is the decision computed, from validated numbers:
 
 | Decision | Condition |
 |---|---|
@@ -415,92 +469,111 @@ Only then is the decision computed, from validated numbers:
 | `notify_verify` | a genuine unknown eligibility blocker, `career_fit ≥ 85`, `opportunity_score ≥ 55` |
 | `notify_strong` | `opportunity_score ≥ 85` |
 | `notify_good` | `opportunity_score ≥ 70` |
-| `notify_stretch` | `opportunity_score ≥ 60` |
+| `notify_stretch` | `opportunity_score ≥ 60` and `career_fit ≥ 75` |
+
+---
+
+## Cost
+
+Discovery is free. Ranking embeds each new ad once (gemini-embedding-001, about
+ten cents per thousand ads) and the matcher profile once per version. The optional
+first read on Flash-Lite costs a fraction of a cent per ad and, in calibration,
+settled about three quarters of the ads that reached it without losing a match.
+The judge reads what is left.
+
+`status` and every run record carry an estimated month-to-date spend, priced
+from recorded tokens at the dearer provider's rates so it errs high. When it
+reaches `monthly_budget_usd`, judging pauses and says so; ranked jobs wait and
+nothing is lost.
 
 ---
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests
 ```
 
-168 tests. No network, no API key, no cost. They cover the decision classifier,
-the Swedish-language policy rules, citizenship and work-eligibility resolution,
-the core-work blocker, provider routing and fallback semantics including which
-failure triggered a fallback, database idempotency and re-queueing on content
-change, snapshot completeness, completeness gaps versus transport failures, the
-bounded cleanup pass, global ranking and delivery ordering, the emergency runtime
-budget and candidate ceiling, repost suppression, the run-summary wording in
-every state, the language-level scale and policy at every level, historical
-recovery (`backfill` selection, evaluation, delivery and run accounting),
-fresh-clone installation, and the doctor onboarding states.
+216 tests. No network, no API key, no cost. They cover the decision classifier,
+the language, citizenship and seniority rules, provider routing and fallback,
+snapshot completeness and cleanup passes, ranking maths and the ranking
+pipeline, embedding and enrichment clients, the monthly budget, each career-site
+collector against recorded payload shapes, discovery failure isolation, repost
+suppression, historical recovery, fresh-clone installation, and `doctor`.
+[GitHub Actions](.github/workflows/tests.yml) runs them on Linux, macOS and
+Windows; the installer tests need a POSIX shell and skip themselves elsewhere.
 
 ---
 
 ## Benchmark
 
-[`benchmark/`](benchmark/) contains a reusable provider benchmark and a
-synthetic ten-case sample set covering the error classes that actually matter
-here: mandatory Swedish, Swedish-preferred, a Swedish-language advertisement
-with no language requirement, background screening, an explicit citizenship
-requirement, an adjacent DevOps role, a specialist stack mismatch, a seniority
-mismatch, a strong match, and an obvious reject.
-
-```bash
-python3 benchmark/benchmark_runner.py dry-run                       # no network, no cost
-python3 benchmark/benchmark_runner.py run --provider gemini --out results/
-python3 benchmark/benchmark_runner.py score results/*.json
-python3 benchmark/benchmark_runner.py replay results/gemini.json    # re-derive after a policy change
-```
-
-The important design choice: the runner scores the **deterministic decision**,
-not the model's self-reported one. It replays every provider response through
-the same policy functions production uses. That distinction found two real bugs
-during development — see [docs/case-study.md](docs/case-study.md).
-
-Methodology and results are in
-[docs/provider-benchmark.md](docs/provider-benchmark.md).
+[`benchmark/`](benchmark/) contains a reusable provider benchmark and a synthetic
+ten-case sample set covering the error classes that matter here. The runner
+scores the **deterministic decision**, not the model's self-reported one, by
+replaying every provider response through the same policy functions production
+uses. Methodology and results are in
+[docs/provider-benchmark.md](docs/provider-benchmark.md); how that approach found
+two real bugs is in [docs/case-study.md](docs/case-study.md).
 
 ---
 
 ## Security and privacy
 
-- **Nothing is committed.** Your `config.json`, your profile files, the database
-  and `secrets.env` are all in `.gitignore`. The repository ships only
-  `*.example.json` templates.
-- **Credentials live in one mode-600 file** inside the home directory, never in
-  the repository, never in a URL, never in a log line. URLs are redacted before
-  logging.
-- **Your CV never leaves your machine.** `career_profile.json` is local-only.
-  Only the compact `matcher_profile.json` is sent to a provider, and you choose
-  what goes in it.
+- **Nothing personal is committed.** Your `config.json`, profile files, the
+  database and `secrets.env` are all in `.gitignore`. The repository ships only
+  `*.example.json` templates describing a fictional candidate.
+- **Credentials live in one mode-600 file**, are sent in request headers, never
+  in a URL, and never logged; URLs are logged without their query string.
+  RoleLens refuses a secrets file other users can read.
+- **Your CV never leaves your machine.** `career_profile.json` is never read by
+  the pipeline. `matcher_profile.json` (and the catalogue, without its
+  `candidate` identity section) is sent to your model provider; its descriptive
+  sections are also sent to the Vertex embedding endpoint and, with
+  `use_enrichment`, to Arbetsförmedlingen's public JobAd Enrichments API. You
+  choose what goes in it.
 - **Job data goes to a third-party model.** Vacancy text is sent to your
-  configured provider for evaluation. That is the whole design, but be aware of
-  it and of your provider's data-retention terms.
-- **Provider responses are archived locally** under the home directory
-  (`data/last_*_response.txt`, `data/model_failures/`) for debugging. They are
-  gitignored; delete them if you do not want them.
-- **No auto-apply, no outbound messages to employers.** RoleLens only reads a
-  public API and prints to stdout.
-- **The example candidate is fictional.** `profile/*.example.json` describes an
-  invented person and invented employers.
+  configured providers. That is the whole design; mind their data-retention terms.
+- **Public sources only.** Discovery reads public APIs and public career-site
+  feeds over HTTPS, one site at a time with a pause between detail pages, and
+  never logs in, submits forms or bypasses access controls.
+- **Provider responses are archived locally** under `data/` for debugging. They
+  are gitignored; delete them if you do not want them.
+- **No auto-apply, no outbound messages to employers.** RoleLens prints to stdout.
+
+---
+
+## Upgrading from 1.x
+
+Version 2 reuses your home directory and database; the schema migrates in place.
+
+1. Pull and re-run `./install.sh`. It adds `role_vocabulary.json` and
+   `knowledge_catalogue.json` from the examples without touching your files —
+   **replace both with your own** (or delete the catalogue).
+2. Merge the new keys from `config.example.json` into your `config.json`
+   (`use_jobstream`, `career_sites`, ranking and budget keys). Existing
+   `search_terms` keep working; `high_signal_title_terms` is no longer read.
+3. Run `doctor`, then `--verbose fetch`, then `--verbose evaluate`.
+
+Behaviour that changed: a run with no match and no problem now prints nothing;
+a stretch card needs `career_fit ≥ 75`; only ranked-and-selected ads are
+evaluated; the Azure fallback also answers when Vertex refuses the account.
+See [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
 ## Project status
 
-Version **1.9.0**. Running daily in production for a single user, against the
-Swedish market, since 2026. It is a personal tool published because the design
-is more broadly interesting, not a product.
+Version **2.0.0**. It grew out of a personal job search in Sweden and runs
+daily in production for that search. It is published because the design is
+more broadly interesting, not as a product.
 
 It is deliberately narrow:
 
-- One source (Arbetsförmedlingen JobSearch) and one market.
-- One candidate profile per installation.
-- One primary provider and one transport fallback; routing is fixed in code.
-- Adjacent and specialist roles are still the weakest judgment area, and it
-  over-notifies there.
+- One market (Sweden) and one candidate profile per installation.
+- One primary provider and one fallback; routing is fixed in code.
+- Ranking constants and first-read thresholds were calibrated on one profile's
+  data; they are sensible defaults, not universal truths.
+- Adjacent and specialist roles are still the weakest judgment area.
 - Output is stdout only; delivery is whatever your scheduler does with it.
 
 Contributions and forks are welcome under the MIT licence. See

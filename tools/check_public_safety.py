@@ -46,6 +46,8 @@ FORBIDDEN_NAMES: frozenset[str] = frozenset({
     "career_profile.json",         # the real one; *.example.json is fine
     "matcher_profile.json",
     "search_lenses.json",
+    "role_vocabulary.json",
+    "knowledge_catalogue.json",
     "benchmark_provider.py",       # private tooling: reads the production database
     "prepare_targeted_benchmark.py",
     "run_targeted_benchmark.py",

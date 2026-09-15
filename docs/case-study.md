@@ -387,10 +387,6 @@ to trip the 300-candidate ceiling or the 3000-second budget has not occurred in
 production. The behaviour is covered by tests, but tests are not the same as
 having seen it happen.
 
-**The candidate's language level is in the code.** The Swedish CEFR level appears
-in the system prompt and the policy layer rather than being read from the
-profile. It works for one installation and is wrong as a general design.
-
 ## 13. Lessons learned
 
 **Derive state, do not store it.** The absence of an evaluation row is a better
@@ -430,3 +426,50 @@ Healthy queued work and provider failures now read differently on purpose.
 cap looks like a safety limit and behaves like an execution bound. Bound the
 expensive unit — the individual model call — and let the number of units follow
 the work.
+
+## 14. Version 2: the whole market, and the model last
+
+Everything above made the judging honest. It did nothing about what reached the
+judge. Discovery was still keyword search, and keyword search was the problem
+the project set out to solve: measured against a full day of the Platsbanken
+feed, a well-tuned set of queries reached 2 of 20 relevant digitalisation roles.
+The roles that describe your work under a title you did not think of were still
+invisible — they just were not invisible to the model any more.
+
+Version 2 inverts the pipeline. **Read everything, rank without a model, and pay
+the model last.**
+
+- **Retrieval became complete and free.** JobStream returns every ad added or
+  changed since a cursor, and collectors read the career sites of employers that
+  publish there and not on Platsbanken. A cursor that advances only after the ads
+  are stored made "complete" survive crashes.
+- **Ranking replaced keyword luck.** A weighted vocabulary built from the
+  profile, embeddings of the profile's own sections, and the competencies
+  Arbetsförmedlingen's enrichment finds each ad requesting — three orders fused
+  by reciprocal rank fusion. The top 15% kept 101 of 102 held-out matches. The
+  lesson from the first version applied again: a cut hides its misses, so a small
+  deterministic random sample of what the cut leaves out is judged anyway, and a
+  miss becomes visible instead of silent.
+- **Deterministic rules moved in front of the model.** Years of experience and
+  seniority are facts in a dated catalogue; nationality is a fact in the profile.
+  Settling them in code before the judge is cheaper and more consistent than
+  asking a model to guess them after.
+- **A cheap first read, allowed only to say no.** It settles confident
+  rejections well below a match and sends everything else — including every
+  failure of its own — to the judge. In calibration it settled three quarters of
+  the ads that reached it and lost no delivered match.
+- **Noise is handled where it costs.** Re-judging identical ads flipped about
+  one card in seven, all near the line. Judging those twice and deciding on the
+  mean costs little, because few ads land there.
+
+One lesson from section 13 was deliberately reversed. **"Make quiet runs loud"
+became "make problems loud".** Once alerts named every degraded state — a failed
+source, a refused account, unavailable embeddings, an exhausted budget — and
+failures kept their non-zero exit, the heartbeat line on quiet runs carried no
+information the operator could act on, and it trained them to ignore the
+channel. A quiet run now prints nothing.
+
+The generalisable version: **spend the expensive component last, and make every
+cheaper stage fail open towards it.** Each stage in front of the judge may only
+remove work it is certain about, and each one's failure sends more work to the
+judge rather than less.

@@ -15,6 +15,8 @@ config.json
 profile/career_profile.json
 profile/matcher_profile.json
 profile/search_lenses.json
+profile/role_vocabulary.json
+profile/knowledge_catalogue.json
 
 # Databases and durable runtime state
 *.db

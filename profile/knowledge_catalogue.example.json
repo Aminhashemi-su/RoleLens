@@ -1,0 +1,68 @@
+{
+  "catalog_version": "1.0",
+  "purpose": "Authoritative record of what the candidate has done, sent to the judge with the matcher profile. RoleLens counts years of experience from the dated professional_experience entries and treats skills marked not_evidenced as absent. THIS IS A SYNTHETIC EXAMPLE.",
+  "candidate": {
+    "name": "Alex Lindqvist (fictional)",
+    "note": "Identity keys under 'candidate' are removed before anything is sent to a model."
+  },
+  "professional_experience": [
+    {
+      "organization": "Fjord Analytics AB (fictional)",
+      "role": "Software Engineer",
+      "period": "2022-08 to 2023-09",
+      "evidence": [
+        "Full-stack feature work on an internal analytics product: React front end, Python API, PostgreSQL.",
+        "Wrote the automated tests and CI pipeline for the modules the team owned."
+      ]
+    },
+    {
+      "organization": "Nordwave Systems AB (fictional)",
+      "role": "Product Engineer",
+      "period": "2023-10 to 2024-05",
+      "evidence": [
+        "Owned two customer-facing modules end to end, including deployment and on-call for those modules.",
+        "Ran discovery sessions with operations staff and turned findings into scoped product work."
+      ]
+    },
+    {
+      "organization": "Nordwave Systems AB (fictional)",
+      "role": "Product Engineer, Applied AI",
+      "period": "2024-06 to present",
+      "evidence": [
+        "Leads the LLM-backed workflow features: structured output, evaluation sets, cost and reliability.",
+        "Built the FastAPI services and React interfaces around those features."
+      ]
+    }
+  ],
+  "education": [
+    {
+      "qualification": "BSc Computer Science",
+      "institution": "A Swedish university (fictional)",
+      "completed": "2022"
+    }
+  ],
+  "capability_catalogue": {
+    "software_engineering": [
+      {"skill": "Python backend and API development", "level": "strong"},
+      {"skill": "TypeScript and React", "level": "strong"},
+      {"skill": "PostgreSQL data modelling", "level": "strong"},
+      {"skill": "Automated testing and CI", "level": "working"},
+      {"skill": "Java or .NET application development", "level": "not_evidenced"},
+      {"skill": "Embedded or firmware development", "level": "not_evidenced"}
+    ],
+    "ai_and_automation": [
+      {"skill": "LLM application engineering and evaluation", "level": "strong"},
+      {"skill": "Retrieval over document sets", "level": "working"},
+      {"skill": "Machine learning model training", "level": "limited_or_not_evidenced"}
+    ],
+    "infrastructure": [
+      {"skill": "Docker and managed cloud deployment", "level": "working"},
+      {"skill": "Kubernetes or SRE platform ownership", "level": "not_evidenced"}
+    ],
+    "product_and_delivery": [
+      {"skill": "End-to-end feature ownership", "level": "strong"},
+      {"skill": "Customer discovery and requirements work", "level": "working"},
+      {"skill": "People management", "level": "not_evidenced"}
+    ]
+  }
+}
